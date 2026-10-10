@@ -11,6 +11,7 @@ import { api, N8nWorkflow, Settings, timeAgo, Workflow } from "@/src/api";
 import { useToast } from "@/src/components/toast";
 import { Badge, Button, PressScale, Segmented } from "@/src/components/ui";
 import { usesNativeTabs } from "@/src/navigation";
+import { FREE_WORKFLOW_LIMIT, useSubscription } from "@/src/revenuecat";
 import { fonts, makeStyles, radius, spacing, useTheme } from "@/src/theme";
 
 const EMPTY_IMG =
@@ -31,6 +32,14 @@ export default function WorkflowsScreen() {
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [q, setQ] = useState("");
+  const { isSubscribed } = useSubscription();
+  const newWorkflow = () => {
+    if (!isSubscribed && items.length >= FREE_WORKFLOW_LIMIT) {
+      router.push({ pathname: "/paywall", params: { feature: `More than ${FREE_WORKFLOW_LIMIT} workflows` } });
+      return;
+    }
+    router.push("/workflow/new");
+  };
 
   const load = useCallback(async () => {
     try {
@@ -149,7 +158,7 @@ export default function WorkflowsScreen() {
       <Image source={{ uri: EMPTY_IMG }} style={styles.emptyImg} contentFit="cover" />
       <Text style={styles.emptyTitle}>No workflows yet</Text>
       <Text style={styles.emptyText}>Build one with the editor, or ask the Agent to create it for you.</Text>
-      <Button title="New workflow" onPress={() => router.push("/workflow/new")} testID="workflows-empty-create-button" />
+      <Button title="New workflow" onPress={newWorkflow} testID="workflows-empty-create-button" />
     </View>
   );
 
@@ -223,7 +232,7 @@ export default function WorkflowsScreen() {
       {mode === "local" && (
         <Pressable
           style={[styles.fab, { bottom: bottomChrome + spacing.lg }]}
-          onPress={() => router.push("/workflow/new")}
+          onPress={newWorkflow}
           testID="workflows-new-fab"
         >
           <Plus size={26} color={colors.onBrandPrimary} weight="bold" />

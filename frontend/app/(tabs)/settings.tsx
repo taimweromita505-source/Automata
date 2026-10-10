@@ -1,7 +1,7 @@
 import { useFocusEffect, useRouter } from "expo-router";
 import * as Haptics from "expo-haptics";
 import * as Location from "expo-location";
-import { Bell, CaretRight, Cloud, Cpu, Key, MapPin, Plugs } from "phosphor-react-native";
+import { Bell, CaretRight, Cloud, Cpu, Crown, Key, MapPin, Plugs } from "phosphor-react-native";
 import React, { useCallback, useState } from "react";
 import { ActivityIndicator, Platform, Pressable, Text, View } from "react-native";
 import { KeyboardAwareScrollView } from "react-native-keyboard-controller";
@@ -13,6 +13,7 @@ import { useToast } from "@/src/components/toast";
 import { Button, Chips, Field, SectionLabel, Segmented } from "@/src/components/ui";
 import { getNotificationPermission, requestNotificationPermission } from "@/src/device";
 import { syncGeofences } from "@/src/geofence";
+import { isTestStore, useRequirePro, useSubscription } from "@/src/revenuecat";
 import { usesNativeTabs } from "@/src/navigation";
 import { fonts, makeStyles, radius, spacing, useTheme } from "@/src/theme";
 
@@ -34,6 +35,8 @@ export default function SettingsScreen() {
   const [testingN8n, setTestingN8n] = useState(false);
   const [testResult, setTestResult] = useState<{ ok: boolean; text: string } | null>(null);
   const router = useRouter();
+  const requirePro = useRequirePro();
+  const { isSubscribed, customerInfo } = useSubscription();
   const [notifStatus, setNotifStatus] = useState<"granted" | "denied" | "blocked" | "undetermined" | "unavailable">("undetermined");
   const [locStatus, setLocStatus] = useState<string>("off");
   const [permSheet, setPermSheet] = useState<null | "notifications" | "location">(null);
@@ -170,7 +173,10 @@ export default function SettingsScreen() {
           <Segmented
             testID="settings-provider"
             value={s.provider}
-            onChange={(v) => set({ provider: v })}
+            onChange={(v) => {
+              if (v === "local" && !requirePro("Local LLM")) return;
+              set({ provider: v });
+            }}
             options={[
               { value: "emergent", label: "Cloud API" },
               { value: "local", label: "Local LLM" },
@@ -241,8 +247,26 @@ export default function SettingsScreen() {
           )}
         </View>
 
+        <SectionLabel>Subscription</SectionLabel>
+        <Pressable style={[styles.card, styles.linkRow]} onPress={() => router.push("/paywall")} testID="settings-subscription-row">
+          <Crown size={20} color={colors.brandPrimary} weight="fill" />
+          <View style={{ flex: 1 }}>
+            <Text style={styles.rowTitle} testID="settings-plan-status">{isSubscribed ? "Automata Pro" : "Free plan"}</Text>
+            <Text style={styles.info}>
+              {isSubscribed
+                ? `Active${customerInfo?.entitlements.active.pro?.expirationDate ? ` · renews ${new Date(customerInfo.entitlements.active.pro.expirationDate).toLocaleDateString()}` : ""}${isTestStore ? " (simulated test purchase)" : ""}`
+                : "3 workflows, 10 agent messages a day. Upgrade for everything."}
+            </Text>
+          </View>
+          {!isSubscribed && (
+            <View style={styles.upgrade}>
+              <Text style={styles.upgradeText}>UPGRADE</Text>
+            </View>
+          )}
+        </Pressable>
+
         <SectionLabel>Connections</SectionLabel>
-        <Pressable style={[styles.card, styles.linkRow]} onPress={() => router.push("/credentials")} testID="settings-credentials-link">
+        <Pressable style={[styles.card, styles.linkRow]} onPress={() => requirePro("Credentials vault") && router.push("/credentials")} testID="settings-credentials-link">
           <Key size={20} color={colors.brandPrimary} />
           <View style={{ flex: 1 }}>
             <Text style={styles.rowTitle}>Credentials vault</Text>
@@ -352,6 +376,8 @@ const useStyles = makeStyles((c) => ({
   },
   testResult: { fontFamily: fonts.mono, fontSize: 12, marginTop: spacing.md },
   linkRow: { flexDirection: "row", alignItems: "center", gap: spacing.md },
+  upgrade: { backgroundColor: c.brandPrimary, borderRadius: radius.sm, paddingHorizontal: spacing.sm, paddingVertical: 4 },
+  upgradeText: { color: c.onBrandPrimary, fontFamily: fonts.display, fontSize: 12, letterSpacing: 1 },
   permRow: { flexDirection: "row", alignItems: "center", gap: spacing.md },
   rowTitle: { color: c.onSurface, fontFamily: fonts.display, fontSize: 17 },
 }));

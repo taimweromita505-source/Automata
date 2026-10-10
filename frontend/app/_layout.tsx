@@ -13,7 +13,14 @@ import { ToastProvider, useToast } from "@/src/components/toast";
 import { deliverPendingActions } from "@/src/device";
 import "@/src/geofence";
 import { queryClient } from "@/src/query-client";
+import { initializeRevenueCat, SubscriptionProvider } from "@/src/revenuecat";
 import { useTheme } from "@/src/theme";
+
+try {
+  initializeRevenueCat();
+} catch (err) {
+  console.warn("RevenueCat unavailable:", err);
+}
 
 /** Delivers phone actions (notifications etc.) queued by scheduled / webhook runs. */
 function PendingActions() {
@@ -58,13 +65,17 @@ export default function RootLayout() {
     <ErrorBoundary>
       <GestureHandlerRootView style={{ flex: 1, backgroundColor: colors.surface }}>
         <QueryClientProvider client={queryClient}>
+          <SubscriptionProvider>
           <KeyboardProvider>
             <ToastProvider>
               <StatusBar style="light" />
               <PendingActions />
-              <Stack screenOptions={{ headerShown: false, contentStyle: { backgroundColor: colors.surface } }} />
+              <Stack screenOptions={{ headerShown: false, contentStyle: { backgroundColor: colors.surface } }}>
+                <Stack.Screen name="paywall" options={{ presentation: "modal" }} />
+              </Stack>
             </ToastProvider>
           </KeyboardProvider>
+          </SubscriptionProvider>
         </QueryClientProvider>
       </GestureHandlerRootView>
     </ErrorBoundary>

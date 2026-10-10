@@ -1,7 +1,7 @@
-import { useFocusEffect } from "expo-router";
+import { useFocusEffect, useRouter } from "expo-router";
 import * as Haptics from "expo-haptics";
 import { ArrowUp, Broom, CheckCircle, CircleNotch, Lightning, Robot, XCircle } from "phosphor-react-native";
-import React, { useCallback, useRef, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import { ActivityIndicator, FlatList, Platform, Pressable, ScrollView, Text, TextInput, View } from "react-native";
 import { KeyboardAvoidingView } from "react-native-keyboard-controller";
 import Animated, { FadeInDown } from "react-native-reanimated";
@@ -11,6 +11,8 @@ import { api, ChatMessage, Settings, streamAgent, ToolCall } from "@/src/api";
 import { useToast } from "@/src/components/toast";
 import { executeDeviceActions } from "@/src/device";
 import { usesNativeTabs } from "@/src/navigation";
+import { FREE_AGENT_DAILY, useSubscription } from "@/src/revenuecat";
+import { storage } from "@/src/utils/storage";
 import { fonts, makeStyles, radius, spacing, useTheme } from "@/src/theme";
 
 const SUGGESTIONS = [
@@ -106,6 +108,17 @@ export default function AgentScreen() {
   const [loading, setLoading] = useState(true);
   const [modelLabel, setModelLabel] = useState("");
   const listRef = useRef<FlatList<ChatMessage>>(null);
+  const router = useRouter();
+  const { isSubscribed } = useSubscription();
+  const [used, setUsed] = useState<number | null>(null);
+
+  useEffect(() => {
+    (async () => {
+      const today = new Date().toISOString().slice(0, 10);
+      const day = await storage.getItem("agent_usage_date", "");
+      setUsed(day === today ? Number(await storage.getItem("agent_usage_count", 0)) : 0);
+    })();
+  }, []);
 
   useFocusEffect(
     useCallback(() => {
@@ -124,6 +137,18 @@ export default function AgentScreen() {
   const send = async (text?: string) => {
     const msg = (text ?? input).trim();
     if (!msg || sending) return;
+    if (!isSubscribed) {
+      const today = new Date().toISOString().slice(0, 10);
+      const day = await storage.getItem("agent_usage_date", "");
+      const count = day === today ? Number(await storage.getItem("agent_usage_count", 0)) : 0;
+      if (count >= FREE_AGENT_DAILY) {
+        router.push({ pathname: "/paywall", params: { feature: `More than ${FREE_AGENT_DAILY} agent messages a day` } });
+        return;
+      }
+      await storage.setItem("agent_usage_date", today);
+      await storage.setItem("agent_usage_count", count + 1);
+      setUsed(count + 1);
+    }
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium).catch(() => {});
     setInput("");
     setSending(true);
@@ -167,7 +192,9 @@ export default function AgentScreen() {
       <View style={[styles.header, { paddingTop: insets.top + spacing.sm }]}>
         <View style={{ flex: 1 }}>
           <Text style={styles.title}>AGENT</Text>
-          <Text style={styles.subtitle} testID="agent-model-label">{modelLabel || "..."}</Text>
+          <Text style={styles.subtitle} testID="agent-model-label">
+            {`${modelLabel || "..."}${!isSubscribed && used !== null ? ` · ${Math.max(0, FREE_AGENT_DAILY - used)} free left today` : ""}`}
+          </Text>
         </View>
         <Pressable onPress={clear} style={styles.headerBtn} testID="agent-clear-button" hitSlop={8}>
           <Broom size={22} color={colors.onSurfaceSecondary} />

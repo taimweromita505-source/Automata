@@ -27,6 +27,7 @@ import { RunLogs } from "@/src/components/run-logs";
 import { defaultConfig, StepForm, StepIcon, stepSummary } from "@/src/components/step-fields";
 import { executeDeviceActions } from "@/src/device";
 import { syncGeofences } from "@/src/geofence";
+import { PRO_STEPS, useRequirePro, useSubscription } from "@/src/revenuecat";
 import { useToast } from "@/src/components/toast";
 import { Badge, Button, Chips, Field, PressScale, Segmented, Sheet } from "@/src/components/ui";
 import { fonts, makeStyles, radius, spacing, useTheme } from "@/src/theme";
@@ -66,6 +67,8 @@ export default function WorkflowEditor() {
   const [credentials, setCredentials] = useState<Credential[]>([]);
   const [locating, setLocating] = useState(false);
   const [locBlocked, setLocBlocked] = useState(false);
+  const requirePro = useRequirePro();
+  const { isSubscribed } = useSubscription();
 
   useEffect(() => {
     api<Credential[]>("/credentials").then(setCredentials).catch(() => {});
@@ -155,6 +158,11 @@ export default function WorkflowEditor() {
   };
 
   const addStep = (type: StepType) => {
+    if (PRO_STEPS.includes(type) && !isSubscribed) {
+      setPicker(false);
+      setTimeout(() => requirePro(STEP_META[type].label), 350);
+      return;
+    }
     const step: Step = { id: Math.random().toString(36).slice(2, 10), type, name: STEP_META[type].label, config: defaultConfig(type) };
     setPicker(false);
     setWf({ ...wf, steps: [...wf.steps, step] });
@@ -357,6 +365,11 @@ export default function WorkflowEditor() {
                     <Text style={styles.nodeTitle}>{STEP_META[t].label}</Text>
                     <Text style={styles.nodeSummary}>{STEP_META[t].hint}</Text>
                   </View>
+                  {!isSubscribed && PRO_STEPS.includes(t) && (
+                    <View style={styles.proBadge} testID={`step-picker-pro-${t}`}>
+                      <Text style={styles.proText}>PRO</Text>
+                    </View>
+                  )}
                 </Pressable>
               ))}
           </View>
@@ -374,7 +387,14 @@ export default function WorkflowEditor() {
         <Segmented
           testID="trigger-type"
           value={trig.type}
-          onChange={(v) => setTrigger({ type: v })}
+          onChange={(v) => {
+            if ((v === "schedule" || v === "location") && !isSubscribed) {
+              setTriggerSheet(false);
+              setTimeout(() => requirePro(v === "schedule" ? "Scheduled triggers" : "Place triggers"), 350);
+              return;
+            }
+            setTrigger({ type: v });
+          }}
           options={[
             { value: "manual", label: "Manual" },
             { value: "schedule", label: "Schedule" },
@@ -587,6 +607,8 @@ const useStyles = makeStyles((c) => ({
     marginBottom: spacing.sm,
     backgroundColor: c.surface,
   },
+  proBadge: { backgroundColor: c.brandPrimary, borderRadius: radius.sm, paddingHorizontal: spacing.sm, paddingVertical: 2 },
+  proText: { color: c.onBrandPrimary, fontFamily: fonts.display, fontSize: 11, letterSpacing: 1 },
   groupLabel: { color: c.brandPrimary, fontFamily: fonts.display, fontSize: 13, letterSpacing: 1.5, marginTop: spacing.md, marginBottom: spacing.sm },
   clipBtn: {
     width: 48,

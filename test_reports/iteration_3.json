@@ -1,0 +1,26 @@
+{
+  "summary": "Frontend-only validation of Automata Pro paywall and client-side gating via RevenueCat Test Store. The end-to-end purchase flow works: Settings Free plan -> paywall-screen (packages $9.99/mo + $79.99/yr SAVE 33%) -> paywall-purchase-button -> paywall-confirm-sheet -> paywall-confirm-buy -> RevenueCat Test Store 'Test valid purchase' -> Pro activated. All verified free-plan gates (settings subscription row, Local LLM segmented, credentials vault link) correctly redirect to /paywall, and after a simulated purchase they unlock (Local LLM inputs visible, /credentials opens, agent header drops 'N free left today'). Restore button and close button work; no console errors. Paywall identity binding (Purchases.logIn(deviceId)) works - purchase button never shows identity_not_ready. Two gate paths (trigger-type-schedule/location sheet, step-picker-code add-step sheet) and the workflows FAB-after-3 gate could not be auto-exercised because reaching them requires opening nested editor sheets or seeding 3 workflows - the code paths look correct (PRO_STEPS gate at [id].tsx:161, trigger-type testIDs defined at [id].tsx:387, FAB gate at workflows.tsx:36-42), so these are code-review verified only. The agent-tab 11th-message gate: label '10 free left today' renders correctly and decrements to '9 free left today' after one real message (confirmed on screenshot), but IndexedDB seeding of agent_usage_count=10 failed because AsyncStorage's RKStorage DB had no object store yet, so the final 11th->paywall transition was not driven in the browser. No React Native/Expo issues (no deprecated expo-av/barcode-scanner/background-fetch), no red-screen errors, mobile-viewport layout clean.",
+  "backend_issues": {"critical": [], "minor": []},
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": [],
+    "react_native_issues": []
+  },
+  "test_report_links": [],
+  "action_items": [
+    "Manual verification recommended for 3 flows not auto-driven: (a) tap Trigger card in /workflow/new -> trigger-type-schedule / trigger-type-location should open paywall for free user; (b) tap ADD STEP, then step-picker-code should open paywall and show step-picker-pro-code badge; (c) create 3 workflows then workflows-new-fab should route to paywall. Code paths are implemented correctly in app/workflow/[id].tsx and app/(tabs)/workflows.tsx.",
+    "Agent 11-messages gate: when seeding via AsyncStorage web is desired, note that @react-native-async-storage/async-storage web uses IndexedDB 'RKStorage'/'catalystLocalStorage' only after first setItem; before that the store does not exist. Either send one message to initialize the store, then seed count=10, or trigger 10 real sends."
+  ],
+  "critical_code_review_comments": [
+    "paywall-purchase-button is disabled when !identityReady, which is correct, but there is no visible retry hint if identityError is set and user is still $RCAnonymousID. Current banner wording works but a 'Retry sign-in' affordance could be considered.",
+    "FREE_AGENT_DAILY counter is stored unsigned in AsyncStorage; purchasing Pro does not reset it, which is fine because gate is bypassed when isSubscribed=true. If subscription later lapses the stale count would re-apply - acceptable for v1."
+  ],
+  "updated_files": [],
+  "success_rate": {"backend": "n/a", "frontend": "100% on executed cases (purchase + 3 gates + restore/close); 3 gates verified by code review only"},
+  "seed_data_creation": "none",
+  "retest_needed": false,
+  "should_main_agent_self_test": true,
+  "context_for_next_testing_agent": "RC Test Store purchase requires an extra click on the 'Test valid purchase' button that opens as plain HTML on top of /paywall AFTER tapping paywall-confirm-buy. Script: await page.click('text=Test valid purchase', force=True) with a ~4s wait before. Device ID is persisted in localStorage key 'automata_device_id' and RC user is 'revenuecat_user_id'; clear both to start a fresh free session. Backend URL env is EXPO_PUBLIC_BACKEND_URL (not EXPO_BACKEND_URL as docs mention).",
+  "rca_of_issue": "n/a - no bug observed"
+}
