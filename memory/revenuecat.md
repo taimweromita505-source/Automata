@@ -9,7 +9,7 @@ This file is supposed to serve as a memory to you if you have to interact with u
 - offering_lookup_key: default
 - Packages (package -> product_id, current price):
   - $rc_monthly -> prod03b3eb2791   ($4.99 / P1M, trial: none)
-  - $rc_annual  -> prod6ae66136d0   ($39.99 / P1Y, trial: none)
+  - $rc_annual  -> prod6ae66136d0   ($39.99 / P1Y, trial: P1W 7-day free trial)
 - Dashboard: https://app.revenuecat.com/projects/projcdbbe8c5
 - App user id: per-install device id from src/api.ts getDeviceId() (no auth in app), bound with Purchases.logIn in src/revenuecat.tsx
 - Gating is client-side only (src/revenuecat.tsx: FREE_WORKFLOW_LIMIT=3, FREE_AGENT_DAILY=10, PRO_STEPS; schedule & place triggers, credentials vault, local LLM are Pro)

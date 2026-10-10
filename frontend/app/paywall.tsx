@@ -48,6 +48,21 @@ export default function Paywall() {
   const label = (p: PurchasesPackage) =>
     p.identifier === "$rc_annual" ? "Yearly" : p.identifier === "$rc_monthly" ? "Monthly" : p.product.title;
   const period = (p: PurchasesPackage) => (p.identifier === "$rc_annual" ? "/year" : p.identifier === "$rc_monthly" ? "/month" : "");
+  // Free trial comes from the store product (iOS introPrice / Android free phase)
+  const trial = (p: PurchasesPackage): string | null => {
+    const intro = p.product.introPrice;
+    if (intro && intro.price === 0) {
+      const unit = intro.periodUnit.toLowerCase();
+      const n = intro.periodNumberOfUnits;
+      return unit === "week" && n === 1 ? "7-day" : `${n}-${unit}`;
+    }
+    const free = p.product.defaultOption?.freePhase?.billingPeriod;
+    if (free) {
+      const unit = free.unit.toLowerCase();
+      return unit === "week" && free.value === 1 ? "7-day" : `${free.value}-${unit}`;
+    }
+    return null;
+  };
   const savings = (p: PurchasesPackage) => {
     if (p.identifier !== "$rc_annual" || !monthly) return null;
     const pct = Math.round((1 - p.product.price / (monthly.product.price * 12)) * 100);
@@ -139,6 +154,9 @@ export default function Paywall() {
                   <View style={{ flex: 1 }}>
                     <Text style={styles.pkgTitle}>{label(p)}</Text>
                     <Text style={styles.pkgPrice}>{`${p.product.priceString}${period(p)}`}</Text>
+                    {trial(p) && (
+                      <Text style={styles.trial} testID={`paywall-trial-${p.identifier}`}>{`${trial(p)} free trial`}</Text>
+                    )}
                   </View>
                   {save && (
                     <View style={styles.save}>
@@ -155,7 +173,13 @@ export default function Paywall() {
       {!isSubscribed && packages.length > 0 && (
         <View style={[styles.footer, { paddingBottom: insets.bottom + spacing.md }]}>
           <Button
-            title={selected ? `Continue · ${selected.product.priceString}${period(selected)}` : "Continue"}
+            title={
+              selected
+                ? trial(selected)
+                  ? `Start ${trial(selected)} free trial`
+                  : `Continue · ${selected.product.priceString}${period(selected)}`
+                : "Continue"
+            }
             onPress={() => (isTestStore ? setConfirm(true) : doPurchase())}
             loading={isPurchasing}
             disabled={!selected || !identityReady}
@@ -164,7 +188,11 @@ export default function Paywall() {
           <Pressable onPress={doRestore} style={styles.restore} disabled={isRestoring} testID="paywall-restore-button">
             <Text style={styles.restoreText}>{isRestoring ? "Restoring..." : "Restore purchases"}</Text>
           </Pressable>
-          <Text style={styles.legal}>Auto-renews until cancelled. Cancel anytime in Google Play / App Store subscriptions.</Text>
+          <Text style={styles.legal}>
+            {selected && trial(selected)
+              ? `Free for ${trial(selected)} period, then ${selected.product.priceString}${period(selected)}. Cancel before the trial ends and you won't be charged. Auto-renews until cancelled.`
+              : "Auto-renews until cancelled. Cancel anytime in Google Play / App Store subscriptions."}
+          </Text>
         </View>
       )}
       {isSubscribed && (
@@ -214,6 +242,7 @@ const useStyles = makeStyles((c) => ({
   radioOn: { borderColor: c.brandPrimary, backgroundColor: c.brandPrimary },
   pkgTitle: { color: c.onSurface, fontFamily: fonts.display, fontSize: 20 },
   pkgPrice: { color: c.onSurfaceTertiary, fontFamily: fonts.mono, fontSize: 13 },
+  trial: { color: c.success, fontFamily: fonts.displaySemi, fontSize: 13, letterSpacing: 0.5, marginTop: 2 },
   save: { backgroundColor: c.brandPrimary, borderRadius: radius.sm, paddingHorizontal: spacing.sm, paddingVertical: 2 },
   saveText: { color: c.onBrandPrimary, fontFamily: fonts.display, fontSize: 12, letterSpacing: 0.8 },
   footer: { paddingHorizontal: spacing.lg, paddingTop: spacing.md, borderTopWidth: 1, borderTopColor: c.border, gap: spacing.sm },
