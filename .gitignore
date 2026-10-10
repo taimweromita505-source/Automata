@@ -31,6 +31,13 @@ dist/
 dist
 
 # Environment files (comprehensive coverage)
+.env
+.env.*
+!.env.example
+
+# Generated cron runtime state
+.emergent/cron/applied.hash
+.emergent/cron/webhook-crons
 
 *token.json*
 *credentials.json*
