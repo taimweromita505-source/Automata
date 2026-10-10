@@ -5,18 +5,35 @@
     "version": "1.0.0",
     "orientation": "portrait",
     "icon": "./assets/images/icon.png",
-    "scheme": "frontend",
+    "scheme": "automata",
     "userInterfaceStyle": "dark",
     "ios": {
       "supportsTablet": true,
-      "bundleIdentifier": "com.emergent.pocketautomation.frimg9"
+      "bundleIdentifier": "com.emergent.pocketautomation.frimg9",
+      "infoPlist": {
+        "NSLocationWhenInUseUsageDescription": "Pick places that trigger your automations",
+        "NSLocationAlwaysAndWhenInUseUsageDescription": "Run automations when you arrive or leave places",
+        "UIBackgroundModes": [
+          "location",
+          "fetch"
+        ]
+      }
     },
     "android": {
       "adaptiveIcon": {
         "foregroundImage": "./assets/images/adaptive-icon.png",
         "backgroundColor": "#0D0D0D"
       },
-      "package": "com.emergent.pocketautomation.frimg9"
+      "package": "com.emergent.pocketautomation.frimg9",
+      "permissions": [
+        "ACCESS_COARSE_LOCATION",
+        "ACCESS_FINE_LOCATION",
+        "ACCESS_BACKGROUND_LOCATION",
+        "FOREGROUND_SERVICE",
+        "FOREGROUND_SERVICE_LOCATION",
+        "POST_NOTIFICATIONS",
+        "VIBRATE"
+      ]
     },
     "web": {
       "bundler": "metro",
@@ -38,7 +55,21 @@
       "expo-image",
       "expo-secure-store",
       "expo-web-browser",
-      "expo-status-bar"
+      "expo-status-bar",
+      [
+        "expo-location",
+        {
+          "locationAlwaysAndWhenInUsePermission": "Run automations when you arrive or leave places",
+          "isAndroidBackgroundLocationEnabled": true,
+          "isIosBackgroundLocationEnabled": true
+        }
+      ],
+      [
+        "expo-notifications",
+        {
+          "color": "#FF6B00"
+        }
+      ]
     ],
     "experiments": {
       "typedRoutes": true

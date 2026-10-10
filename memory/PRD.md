@@ -16,6 +16,14 @@ Build a mobile app with built-in n8n and an agent powered by local LLM or API pr
 - Dark tactical design (Rajdhani / IBM Plex fonts, amber #FF6B00 accent, Phosphor icons)
 
 ## Implemented (2026-06)
+- Iteration 2 ("automate anything"):
+  - Every install gets its own device ID (X-Device-Id header), so each user has separate workflows, runs, chats, settings and credentials
+  - Encrypted credentials vault (Fernet) where users add their own keys: Telegram, Slack, Discord, Resend, Google OAuth (client + refresh token), Bearer, API-key header, Basic, Custom
+  - New steps: Python code (sandboxed subprocess with limits), web scraper, web search (Bing HTML), If/Else (stop or skip), Loop, Telegram, Slack, Discord, Email, Google Sheets/Gmail/Drive/Calendar, Phone action (notify/clipboard/open_url/share/vibrate); {{cred.NAME.field}} templates; HTTP steps can use a saved credential
+  - Agent acts directly: web_search, fetch_url, http_request, run_code, run_step, list_credentials, update_workflow; phone actions are streamed to the device
+  - Phone triggers: place-based geofence (expo-location + task-manager), deep link automata://run/<id>?input=, run with clipboard; phone actions queued by background runs are delivered when the app opens
+  - Permission sheets with Open Settings fallback; app.json updated with location/notification permissions and the automata scheme
+  - Tested: backend 32/32, frontend passed
 - Workflow builder with vertical node chain, reorder, step config sheets, run results with console logs
 - Manual, schedule and webhook triggers; active toggles; run history
 - AI agent chat with streaming replies and task cards, persisted history, suggestions

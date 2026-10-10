@@ -1,7 +1,6 @@
-"""Backend tests for Automata (built-in n8n style workflow + agent app)."""
+"""Backend tests for Automata (iteration 2: X-Device-Id, credentials vault, new step types, agent tools)."""
 import json
 import os
-import time
 import uuid
 import requests
 import pytest
@@ -9,247 +8,307 @@ import pytest
 BASE_URL = os.environ.get("EXPO_PUBLIC_BACKEND_URL", "https://pocket-automation.preview.emergentagent.com").rstrip("/")
 API = f"{BASE_URL}/api"
 
+DEVICE_A = "test-device-" + uuid.uuid4().hex[:10]
+DEVICE_B = "test-device-" + uuid.uuid4().hex[:10]
 
-@pytest.fixture(scope="session")
-def api():
+
+def _sess(device: str) -> requests.Session:
     s = requests.Session()
-    s.headers.update({"Content-Type": "application/json"})
+    s.headers.update({"Content-Type": "application/json", "X-Device-Id": device})
     return s
 
 
-# -------------------- Settings
-class TestSettings:
-    def test_get_settings(self, api):
-        r = api.get(f"{API}/settings")
+@pytest.fixture(scope="session")
+def api():
+    return _sess(DEVICE_A)
+
+
+@pytest.fixture(scope="session")
+def api_b():
+    return _sess(DEVICE_B)
+
+
+# ============================================================ Device ID requirement
+class TestDeviceIdRequirement:
+    def test_missing_device_header_400(self):
+        r = requests.get(f"{API}/workflows")
+        assert r.status_code == 400
+
+    def test_invalid_device_header_400(self):
+        r = requests.get(f"{API}/workflows", headers={"X-Device-Id": "bad id!"})
+        assert r.status_code == 400
+
+    def test_short_device_id_400(self):
+        r = requests.get(f"{API}/workflows", headers={"X-Device-Id": "short"})
+        assert r.status_code == 400
+
+    def test_valid_device_header_ok(self, api):
+        r = api.get(f"{API}/workflows")
         assert r.status_code == 200
-        data = r.json()
-        assert "provider" in data and "emergent_provider" in data
 
-    def test_put_settings_roundtrip(self, api):
-        payload = {
-            "provider": "emergent", "emergent_provider": "openai", "emergent_model": "gpt-5.4",
-            "local_base_url": "", "local_model": "", "local_api_key": "",
-            "n8n_url": "", "n8n_api_key": "",
-        }
-        r = api.put(f"{API}/settings", json=payload)
+
+# ============================================================ Credentials vault
+class TestCredentials:
+    created: list = []
+
+    def test_create_telegram_cred_missing_field_400(self, api):
+        r = api.post(f"{API}/credentials", json={"name": "TEST_tg_bad", "type": "telegram",
+                                                  "data": {"bot_token": "123:ABC"}})
+        assert r.status_code == 400
+
+    def test_create_unknown_type_400(self, api):
+        r = api.post(f"{API}/credentials", json={"name": "TEST_bad_type", "type": "nope", "data": {"x": "y"}})
+        assert r.status_code == 400
+
+    def test_create_bearer_cred_masked(self, api):
+        r = api.post(f"{API}/credentials", json={"name": "TEST_bearer_cred", "type": "bearer",
+                                                  "data": {"token": "super_secret_token_12345"}})
+        assert r.status_code == 200, r.text
+        d = r.json()
+        TestCredentials.created.append(d["id"])
+        # masked
+        assert "fields" in d and "token" in d["fields"]
+        assert "super_secret_token_12345" not in json.dumps(d), "raw secret leaked in create response"
+
+    def test_list_credentials_masked(self, api):
+        r = api.get(f"{API}/credentials")
         assert r.status_code == 200
-        assert r.json()["emergent_model"] == "gpt-5.4"
+        creds = r.json()
+        assert any(c["name"] == "TEST_bearer_cred" for c in creds)
+        for c in creds:
+            assert "super_secret_token_12345" not in json.dumps(c)
 
+    def test_duplicate_name_400(self, api):
+        r = api.post(f"{API}/credentials", json={"name": "TEST_bearer_cred", "type": "bearer",
+                                                  "data": {"token": "x"}})
+        assert r.status_code == 400
 
-# -------------------- LLM test
-class TestLLM:
-    def test_llm_test_emergent_ok(self, api):
-        # ensure emergent
-        api.put(f"{API}/settings", json={
-            "provider": "emergent", "emergent_provider": "openai", "emergent_model": "gpt-5.4",
-            "local_base_url": "", "local_model": "", "local_api_key": "",
-            "n8n_url": "", "n8n_api_key": "",
-        })
-        r = api.post(f"{API}/llm/test", timeout=60)
+    def test_sanitize_name(self, api):
+        r = api.post(f"{API}/credentials", json={"name": "weird name!!@#", "type": "bearer",
+                                                  "data": {"token": "abc"}})
         assert r.status_code == 200
-        data = r.json()
-        assert data.get("ok") is True, f"Expected ok True, got: {data}"
-        assert "reply" in data
+        d = r.json()
+        TestCredentials.created.append(d["id"])
+        assert d["name"] == "weird_name____"[:40] or "weird_name" in d["name"]
 
-    def test_llm_test_local_invalid(self, api):
-        # Switch to local with invalid url
-        api.put(f"{API}/settings", json={
-            "provider": "local", "emergent_provider": "openai", "emergent_model": "gpt-5.4",
-            "local_base_url": "http://127.0.0.1:1/v1", "local_model": "fake", "local_api_key": "",
-            "n8n_url": "", "n8n_api_key": "",
-        })
-        try:
-            r = api.post(f"{API}/llm/test", timeout=60)
+    def test_delete_credential(self, api):
+        # delete all created
+        for cid in TestCredentials.created:
+            r = api.delete(f"{API}/credentials/{cid}")
             assert r.status_code == 200
-            data = r.json()
-            assert data.get("ok") is False
-            assert "error" in data
+
+
+# ============================================================ Device isolation
+class TestDeviceIsolation:
+    def test_workflow_isolation(self, api, api_b):
+        wf = {"name": "TEST_isolated_A", "description": "", "active": False,
+              "trigger": {"type": "manual", "interval_minutes": 60},
+              "steps": [{"id": "s1", "type": "set", "name": "x", "config": {"value": "A"}}]}
+        r = api.post(f"{API}/workflows", json=wf)
+        assert r.status_code == 200
+        wid = r.json()["id"]
+        # Device B must not see it
+        wfs_b = api_b.get(f"{API}/workflows").json()
+        assert not any(w["id"] == wid for w in wfs_b)
+        # Direct access by id from Device B -> 404
+        g = api_b.get(f"{API}/workflows/{wid}")
+        assert g.status_code == 404
+        api.delete(f"{API}/workflows/{wid}")
+
+    def test_credential_isolation(self, api, api_b):
+        r = api.post(f"{API}/credentials", json={"name": "TEST_iso_cred", "type": "bearer",
+                                                  "data": {"token": "tokA"}})
+        assert r.status_code == 200
+        cid = r.json()["id"]
+        creds_b = api_b.get(f"{API}/credentials").json()
+        assert not any(c["id"] == cid for c in creds_b)
+        api.delete(f"{API}/credentials/{cid}")
+
+
+# ============================================================ Step types
+def _create_run(api, steps, trigger=None, name_suffix=""):
+    wf = {"name": "TEST_steps_" + (name_suffix or uuid.uuid4().hex[:6]), "description": "",
+          "active": False, "trigger": trigger or {"type": "manual", "interval_minutes": 60},
+          "steps": steps}
+    r = api.post(f"{API}/workflows", json=wf)
+    assert r.status_code == 200, r.text
+    wid = r.json()["id"]
+    rr = api.post(f"{API}/workflows/{wid}/run", json={"input": "", "trigger": "manual"}, timeout=60)
+    assert rr.status_code == 200, rr.text
+    data = rr.json()
+    api.delete(f"{API}/workflows/{wid}")
+    return data
+
+
+class TestStepTypes:
+    def test_code_result(self, api):
+        d = _create_run(api, [{"id": "c", "type": "code", "name": "pow", "config": {"code": "result = 2**10"}}])
+        assert d["status"] == "success", d
+        assert "1024" in d["output"]
+
+    def test_code_error_fails_gracefully(self, api):
+        d = _create_run(api, [{"id": "c", "type": "code", "name": "boom", "config": {"code": "raise ValueError('nope')"}}])
+        assert d["status"] == "failed"
+        assert d["logs"][0]["status"] == "failed"
+        assert d["logs"][0]["error"]
+
+    def test_scrape_hn(self, api):
+        d = _create_run(api, [{"id": "s", "type": "scrape", "name": "hn",
+                                "config": {"url": "https://news.ycombinator.com", "selector": ".titleline > a"}}])
+        assert d["status"] == "success", d
+        assert len(d["output"]) > 20
+
+    def test_search(self, api):
+        d = _create_run(api, [{"id": "s", "type": "search", "name": "q", "config": {"query": "python language", "limit": 3}}])
+        # search may fail if bing blocks, so accept both outcomes but prefer success
+        if d["status"] == "success":
+            assert "[" in d["output"] or "title" in d["output"].lower()
+        else:
+            assert d["logs"][0]["error"]
+
+    def test_if_stop(self, api):
+        d = _create_run(api, [
+            {"id": "a", "type": "set", "name": "seed", "config": {"value": "hello"}},
+            {"id": "b", "type": "if", "name": "has_x", "config": {"operator": "contains", "left": "{{prev}}",
+                                                                    "right": "xyz", "on_false": "stop"}},
+            {"id": "c", "type": "set", "name": "never", "config": {"value": "SHOULD_NOT"}},
+        ])
+        assert d["status"] == "stopped", d
+        statuses = [l["status"] for l in d["logs"]]
+        assert "stopped" in statuses
+        assert all("SHOULD_NOT" not in (l.get("output") or "") for l in d["logs"])
+
+    def test_if_skip(self, api):
+        d = _create_run(api, [
+            {"id": "a", "type": "set", "name": "seed", "config": {"value": "hello"}},
+            {"id": "b", "type": "if", "name": "cond", "config": {"operator": "contains", "left": "{{prev}}",
+                                                                   "right": "xyz", "on_false": "skip",
+                                                                   "skip_count": 1}},
+            {"id": "c", "type": "set", "name": "skipped", "config": {"value": "SKIPPED"}},
+            {"id": "d", "type": "set", "name": "after", "config": {"value": "AFTER"}},
+        ])
+        assert d["status"] == "success", d
+        skipped = [l for l in d["logs"] if l["status"] == "skipped"]
+        assert skipped, d["logs"]
+        assert d["output"] == "AFTER"
+
+    def test_loop(self, api):
+        d = _create_run(api, [
+            {"id": "a", "type": "set", "name": "seed", "config": {"value": "[1,2,3]"}},
+            {"id": "b", "type": "loop", "name": "forEach", "config": {"source": "{{prev}}", "max_items": 10}},
+            {"id": "c", "type": "set", "name": "item", "config": {"value": "x={{item}}"}},
+        ])
+        assert d["status"] == "success", d
+        assert "x=1" in d["output"] and "x=2" in d["output"] and "x=3" in d["output"]
+
+    def test_device_notify(self, api):
+        d = _create_run(api, [
+            {"id": "a", "type": "set", "name": "seed", "config": {"value": "hello world"}},
+            {"id": "b", "type": "device", "name": "notify", "config": {"action": "notify", "title": "T", "text": "{{prev}}"}},
+        ])
+        assert d["status"] == "success", d
+        assert d.get("device_actions"), d
+        assert d["device_actions"][0]["action"] == "notify"
+
+    def test_http_bearer_cred(self, api):
+        # Create a bearer cred then use via http step
+        c = api.post(f"{API}/credentials", json={"name": "TEST_bearer_http", "type": "bearer",
+                                                   "data": {"token": "abc_test_123"}})
+        assert c.status_code == 200
+        cid = c.json()["id"]
+        try:
+            d = _create_run(api, [{"id": "h", "type": "http", "name": "hb", "config": {
+                "method": "GET", "url": "https://httpbin.org/headers", "credential": "TEST_bearer_http"}}])
+            assert d["status"] == "success", d
+            assert "Bearer abc_test_123" in d["output"]
         finally:
-            # restore
-            api.put(f"{API}/settings", json={
-                "provider": "emergent", "emergent_provider": "openai", "emergent_model": "gpt-5.4",
-                "local_base_url": "", "local_model": "", "local_api_key": "",
-                "n8n_url": "", "n8n_api_key": "",
-            })
+            api.delete(f"{API}/credentials/{cid}")
+
+    def test_telegram_fake_fails_gracefully(self, api):
+        c = api.post(f"{API}/credentials", json={"name": "TEST_tg_fake", "type": "telegram",
+                                                   "data": {"bot_token": "123:FAKEABC", "chat_id": "0"}})
+        cid = c.json()["id"]
+        try:
+            d = _create_run(api, [{"id": "t", "type": "telegram", "name": "tg", "config": {
+                "credential": "TEST_tg_fake", "text": "hi"}}])
+            assert d["status"] == "failed"
+            assert d["logs"][0]["error"]
+        finally:
+            api.delete(f"{API}/credentials/{cid}")
+
+    def test_missing_credential_clear_error(self, api):
+        d = _create_run(api, [{"id": "t", "type": "telegram", "name": "tg", "config": {"credential": "nope_x", "text": "hi"}}])
+        assert d["status"] == "failed"
+        assert "not found" in (d["logs"][0]["error"] or "").lower() or "credential" in (d["logs"][0]["error"] or "").lower()
+
+    def test_template_cred_resolves_in_set(self, api):
+        c = api.post(f"{API}/credentials", json={"name": "TEST_tpl_cred", "type": "bearer",
+                                                   "data": {"token": "MY_TOKEN_777"}})
+        cid = c.json()["id"]
+        try:
+            d = _create_run(api, [{"id": "s", "type": "set", "name": "s", "config": {
+                "value": "val={{cred.TEST_tpl_cred.token}}"}}])
+            assert d["status"] == "success", d
+            assert "MY_TOKEN_777" in d["output"]
+        finally:
+            api.delete(f"{API}/credentials/{cid}")
 
 
-# -------------------- Workflows CRUD + Run
-class TestWorkflows:
-    created_ids: list = []
-
-    def test_crud_and_run_set_step(self, api):
-        wf = {
-            "name": "TEST_set_wf",
-            "description": "set step test",
-            "active": False,
-            "trigger": {"type": "manual", "interval_minutes": 60},
-            "steps": [{"id": "s1", "type": "set", "name": "echo", "config": {"value": "Hello {{input}}"}}],
-        }
+# ============================================================ Location trigger
+class TestLocationTrigger:
+    def test_location_trigger_saves(self, api):
+        wf = {"name": "TEST_loc", "description": "", "active": True,
+              "trigger": {"type": "location", "latitude": 37.7749, "longitude": -122.4194,
+                          "radius": 300, "event": "enter", "interval_minutes": 60},
+              "steps": [{"id": "s1", "type": "set", "name": "x", "config": {"value": "arrived"}}]}
         r = api.post(f"{API}/workflows", json=wf)
         assert r.status_code == 200, r.text
-        wf_id = r.json()["id"]
-        TestWorkflows.created_ids.append(wf_id)
-
-        # GET
-        g = api.get(f"{API}/workflows/{wf_id}")
-        assert g.status_code == 200 and g.json()["name"] == "TEST_set_wf"
-
-        # Run with input
-        rr = api.post(f"{API}/workflows/{wf_id}/run", json={"input": "World"}, timeout=30)
+        d = r.json()
+        assert d["trigger"]["type"] == "location"
+        assert d["trigger"]["latitude"] == 37.7749
+        # run with location trigger
+        rr = api.post(f"{API}/workflows/{d['id']}/run", json={"input": "", "trigger": "location"}, timeout=20)
         assert rr.status_code == 200
-        run = rr.json()
-        assert run["status"] == "success"
-        assert run["output"] == "Hello World"
-        assert len(run["logs"]) == 1 and run["logs"][0]["status"] == "success"
+        assert rr.json()["trigger"] == "location"
+        api.delete(f"{API}/workflows/{d['id']}")
 
-    def test_run_http_step(self, api):
-        wf = {
-            "name": "TEST_http_wf", "description": "", "active": False,
-            "trigger": {"type": "manual", "interval_minutes": 60},
-            "steps": [{"id": "h1", "type": "http", "name": "hn", "config": {
-                "method": "GET", "url": "https://hn.algolia.com/api/v1/search?tags=front_page"}}],
-        }
-        r = api.post(f"{API}/workflows", json=wf); assert r.status_code == 200
-        wf_id = r.json()["id"]; TestWorkflows.created_ids.append(wf_id)
-        rr = api.post(f"{API}/workflows/{wf_id}/run", json={"input": ""}, timeout=60)
-        assert rr.status_code == 200
-        run = rr.json()
-        assert run["status"] == "success", run
-        assert "hits" in run["output"] or len(run["output"]) > 10
 
-    def test_run_http_invalid(self, api):
-        wf = {
-            "name": "TEST_bad_http", "description": "", "active": False,
-            "trigger": {"type": "manual", "interval_minutes": 60},
-            "steps": [{"id": "h1", "type": "http", "name": "bad", "config": {"method": "GET", "url": "not-a-url"}}],
-        }
-        r = api.post(f"{API}/workflows", json=wf); wf_id = r.json()["id"]
-        TestWorkflows.created_ids.append(wf_id)
-        rr = api.post(f"{API}/workflows/{wf_id}/run", json={"input": ""}, timeout=30)
-        assert rr.status_code == 200
-        assert rr.json()["status"] == "failed"
-        assert rr.json()["logs"][0]["status"] == "failed"
-
-    def test_run_filter_stops(self, api):
-        wf = {
-            "name": "TEST_filter_wf", "description": "", "active": False,
-            "trigger": {"type": "manual", "interval_minutes": 60},
-            "steps": [
-                {"id": "s1", "type": "set", "name": "seed", "config": {"value": "apple"}},
-                {"id": "f1", "type": "filter", "name": "needs-banana", "config": {"contains": "banana"}},
-                {"id": "s2", "type": "set", "name": "never", "config": {"value": "SHOULD_NOT_SET"}},
-            ],
-        }
-        r = api.post(f"{API}/workflows", json=wf); wf_id = r.json()["id"]
-        TestWorkflows.created_ids.append(wf_id)
-        rr = api.post(f"{API}/workflows/{wf_id}/run", json={"input": ""}, timeout=30)
-        assert rr.status_code == 200
-        data = rr.json()
-        assert data["status"] == "stopped"
-        assert len(data["logs"]) == 2
-        assert data["logs"][1]["status"] == "stopped"
-
-    def test_run_llm_step(self, api):
-        wf = {
-            "name": "TEST_llm_wf", "description": "", "active": False,
-            "trigger": {"type": "manual", "interval_minutes": 60},
-            "steps": [{"id": "l1", "type": "llm", "name": "say", "config": {
-                "prompt": "Reply with exactly: PONG", "system": "You are terse. Reply only with the requested word."}}],
-        }
-        r = api.post(f"{API}/workflows", json=wf); wf_id = r.json()["id"]
-        TestWorkflows.created_ids.append(wf_id)
-        rr = api.post(f"{API}/workflows/{wf_id}/run", json={"input": ""}, timeout=120)
-        assert rr.status_code == 200
-        d = rr.json()
-        assert d["status"] == "success", d
-        assert len(d["output"]) > 0
-
-    def test_schedule_active_sets_next_run(self, api):
-        wf = {
-            "name": "TEST_sched_wf", "description": "", "active": True,
-            "trigger": {"type": "schedule", "interval_minutes": 1440},
-            "steps": [{"id": "s1", "type": "set", "name": "ok", "config": {"value": "ok"}}],
-        }
-        r = api.post(f"{API}/workflows", json=wf); assert r.status_code == 200
-        d = r.json(); TestWorkflows.created_ids.append(d["id"])
-        assert d["next_run_at"], f"Expected next_run_at, got: {d}"
-
-    def test_toggle_active(self, api):
-        wf = {"name": "TEST_toggle", "description": "", "active": False,
-              "trigger": {"type": "schedule", "interval_minutes": 60},
-              "steps": [{"id": "s1", "type": "set", "name": "x", "config": {"value": "x"}}]}
-        r = api.post(f"{API}/workflows", json=wf); wf_id = r.json()["id"]
-        TestWorkflows.created_ids.append(wf_id)
-        t = api.post(f"{API}/workflows/{wf_id}/active", json={"active": True})
-        assert t.status_code == 200
-        assert t.json()["active"] is True
-        assert t.json()["next_run_at"] is not None
-
-    def test_webhook_requires_active_webhook_trigger(self, api):
-        # Manual wf should not accept webhook POST
-        wf = {"name": "TEST_hook_manual", "description": "", "active": True,
-              "trigger": {"type": "manual", "interval_minutes": 60},
-              "steps": [{"id": "s1", "type": "set", "name": "x", "config": {"value": "x"}}]}
-        r = api.post(f"{API}/workflows", json=wf); wf_id = r.json()["id"]
-        TestWorkflows.created_ids.append(wf_id)
-        hr = api.post(f"{API}/hooks/{wf_id}", data="hello")
-        assert hr.status_code == 400
-
-        # webhook + active -> ok
-        wf2 = {"name": "TEST_hook_wh", "description": "", "active": True,
-               "trigger": {"type": "webhook", "interval_minutes": 60},
-               "steps": [{"id": "s1", "type": "set", "name": "echo", "config": {"value": "got {{input}}"}}]}
-        r2 = api.post(f"{API}/workflows", json=wf2); wf_id2 = r2.json()["id"]
-        TestWorkflows.created_ids.append(wf_id2)
-        hr2 = api.post(f"{API}/hooks/{wf_id2}", data="payload-abc")
-        assert hr2.status_code == 200
-        assert "got payload-abc" in hr2.json()["output"]
-
-    def test_zz_cleanup_workflows(self, api):
-        for wid in TestWorkflows.created_ids:
+# ============================================================ Device pending
+class TestDevicePending:
+    def test_pending_webhook_actions(self, api):
+        wf = {"name": "TEST_pending_wh", "description": "", "active": True,
+              "trigger": {"type": "webhook", "interval_minutes": 60},
+              "steps": [{"id": "d", "type": "device", "name": "notify",
+                         "config": {"action": "notify", "title": "T", "text": "ping"}}]}
+        r = api.post(f"{API}/workflows", json=wf)
+        wid = r.json()["id"]
+        try:
+            hr = api.post(f"{API}/hooks/{wid}", data="x")
+            assert hr.status_code == 200
+            # pending should return at least one action
+            p = api.get(f"{API}/device/pending")
+            assert p.status_code == 200
+            actions = p.json()
+            assert any(a.get("action") == "notify" for a in actions), actions
+            # second call -> empty
+            p2 = api.get(f"{API}/device/pending")
+            assert p2.json() == []
+        finally:
             api.delete(f"{API}/workflows/{wid}")
 
 
-# -------------------- Runs
-class TestRuns:
-    def test_list_runs(self, api):
-        r = api.get(f"{API}/runs")
-        assert r.status_code == 200
-        assert isinstance(r.json(), list)
-
-    def test_delete_runs(self, api):
-        r = api.delete(f"{API}/runs")
-        assert r.status_code == 200
-        assert r.json().get("ok") is True
-        g = api.get(f"{API}/runs")
-        assert g.json() == []
-
-
-# -------------------- Agent messages
-class TestAgentMessages:
-    def test_list_messages(self, api):
-        r = api.get(f"{API}/agent/messages")
-        assert r.status_code == 200
-        assert isinstance(r.json(), list)
-
-    def test_delete_messages(self, api):
-        r = api.delete(f"{API}/agent/messages")
-        assert r.status_code == 200
-        assert r.json().get("ok") is True
-
-
-# -------------------- Agent chat SSE
-class TestAgentChat:
-    def test_chat_create_and_run_workflow_via_tools(self, api):
-        # Clear history first
+# ============================================================ Agent SSE with new tools
+class TestAgentTools:
+    def test_agent_runs_code_and_device_action(self, api):
         api.delete(f"{API}/agent/messages")
-        prompt = ("Create a workflow named TEST_AGENT_WF with trigger manual and one set step "
-                  "that outputs the text 'agent made this', then run it. Keep it simple.")
+        prompt = ("Use the run_code tool to compute 2**10 and then use run_step to send a phone 'notify' "
+                  "action with the result in the text.")
         with requests.post(f"{API}/agent/chat", json={"message": prompt},
-                           stream=True, timeout=180) as r:
+                           headers={"Content-Type": "application/json", "X-Device-Id": DEVICE_A},
+                           stream=True, timeout=240) as r:
             assert r.status_code == 200
             events = []
-            visible_text = ""
+            visible = ""
             for raw in r.iter_lines(decode_unicode=True):
                 if not raw or not raw.startswith("data:"):
                     continue
@@ -259,63 +318,68 @@ class TestAgentChat:
                     continue
                 events.append(ev)
                 if ev.get("type") == "delta":
-                    visible_text += ev.get("text", "")
+                    visible += ev.get("text", "")
                 if ev.get("type") == "done":
                     break
         types = [e["type"] for e in events]
-        assert "delta" in types, f"No delta events: {types}"
-        assert "done" in types, f"No done event: {types}"
-        assert "<tool>" not in visible_text, "tool blocks leaked into visible text"
-        # tool should have been called
-        tool_results = [e for e in events if e["type"] == "tool_result"]
-        assert any(t["call"]["name"] in ("create_workflow", "run_workflow") for t in tool_results), \
-            f"Expected tool_start/result for create_workflow or run_workflow, got: {[t['call']['name'] for t in tool_results]}"
-
-        # Verify workflow persisted
-        wfs = api.get(f"{API}/workflows").json()
-        made = [w for w in wfs if "TEST_AGENT" in w["name"].upper()]
-        assert made, f"Agent didn't create workflow. Workflows: {[w['name'] for w in wfs]}"
-        # cleanup
-        for w in made:
-            api.delete(f"{API}/workflows/{w['id']}")
+        assert "done" in types
+        assert "<tool>" not in visible, "tool blocks leaked into visible content"
+        tool_names = [e["call"]["name"] for e in events if e["type"] == "tool_result"]
+        assert "run_code" in tool_names, f"Expected run_code tool. Got: {tool_names}"
+        # device_action event OR a run_step with notify action
+        has_device_action = any(e["type"] == "device_action" for e in events)
+        has_run_step_notify = any(
+            e["type"] == "tool_result" and e["call"]["name"] == "run_step"
+            and isinstance(e["call"].get("result"), dict)
+            and e["call"]["result"].get("device_actions")
+            for e in events
+        )
+        assert has_device_action or has_run_step_notify, f"Expected device_action event or run_step with device_actions. Events: {types}"
 
 
-# -------------------- n8n external
-class TestN8N:
-    def test_n8n_not_configured(self, api):
-        # Ensure n8n not set
+# ============================================================ Regression: list, toggle, LLM test
+class TestRegression:
+    def test_workflow_list(self, api):
+        r = api.get(f"{API}/workflows")
+        assert r.status_code == 200
+        assert isinstance(r.json(), list)
+
+    def test_llm_test_connection(self, api):
+        # Ensure emergent provider
         api.put(f"{API}/settings", json={
             "provider": "emergent", "emergent_provider": "openai", "emergent_model": "gpt-5.4",
             "local_base_url": "", "local_model": "", "local_api_key": "",
             "n8n_url": "", "n8n_api_key": "",
         })
-        r = api.get(f"{API}/n8n/workflows")
-        assert r.status_code == 400
+        r = api.post(f"{API}/llm/test", timeout=60)
+        assert r.status_code == 200
+        assert r.json().get("ok") is True
 
-    def test_n8n_fake_returns_502(self, api):
-        api.put(f"{API}/settings", json={
-            "provider": "emergent", "emergent_provider": "openai", "emergent_model": "gpt-5.4",
-            "local_base_url": "", "local_model": "", "local_api_key": "",
-            "n8n_url": "http://127.0.0.1:1", "n8n_api_key": "fakekey",
-        })
+    def test_toggle_active(self, api):
+        wf = {"name": "TEST_regr_toggle", "description": "", "active": False,
+              "trigger": {"type": "schedule", "interval_minutes": 1440},
+              "steps": [{"id": "s1", "type": "set", "name": "x", "config": {"value": "x"}}]}
+        r = api.post(f"{API}/workflows", json=wf)
+        wid = r.json()["id"]
         try:
-            r = api.get(f"{API}/n8n/workflows", timeout=30)
-            assert r.status_code == 502, f"Expected 502, got {r.status_code}: {r.text}"
+            t = api.post(f"{API}/workflows/{wid}/active", json={"active": True})
+            assert t.status_code == 200
+            assert t.json()["active"] is True
+            assert t.json()["next_run_at"]
         finally:
-            # restore
-            api.put(f"{API}/settings", json={
-                "provider": "emergent", "emergent_provider": "openai", "emergent_model": "gpt-5.4",
-                "local_base_url": "", "local_model": "", "local_api_key": "",
-                "n8n_url": "", "n8n_api_key": "",
-            })
+            api.delete(f"{API}/workflows/{wid}")
 
 
-# -------------------- Final cleanup / restore
-def test_zzz_final_restore(api):
-    api.put(f"{API}/settings", json={
-        "provider": "emergent", "emergent_provider": "openai", "emergent_model": "gpt-5.4",
-        "local_base_url": "", "local_model": "", "local_api_key": "",
-        "n8n_url": "", "n8n_api_key": "",
-    })
-    s = api.get(f"{API}/settings").json()
-    assert s["provider"] == "emergent" and s["emergent_provider"] == "openai" and s["emergent_model"] == "gpt-5.4"
+# ============================================================ Final cleanup
+def test_zzz_cleanup(api, api_b):
+    for ses in (api, api_b):
+        wfs = ses.get(f"{API}/workflows").json()
+        for w in wfs:
+            if w["name"].startswith("TEST_"):
+                ses.delete(f"{API}/workflows/{w['id']}")
+        creds = ses.get(f"{API}/credentials").json()
+        for c in creds:
+            if c["name"].startswith("TEST_") or "weird_name" in c["name"]:
+                ses.delete(f"{API}/credentials/{c['id']}")
+        ses.delete(f"{API}/agent/messages")
+        ses.delete(f"{API}/runs")

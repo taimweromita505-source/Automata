@@ -9,23 +9,31 @@ import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 import { api, ChatMessage, Settings, streamAgent, ToolCall } from "@/src/api";
 import { useToast } from "@/src/components/toast";
+import { executeDeviceActions } from "@/src/device";
 import { usesNativeTabs } from "@/src/navigation";
 import { fonts, makeStyles, radius, spacing, useTheme } from "@/src/theme";
 
 const SUGGESTIONS = [
-  "Every morning fetch Hacker News and summarize the top 5 stories",
-  "Create a webhook workflow that classifies incoming text as urgent or not",
-  "List my workflows",
-  "Get the current weather in Berlin and write a one-line forecast",
+  "Search the web for today's top AI news and give me 5 bullet points",
+  "Every morning fetch Hacker News, summarize the top 5 and send it to my Telegram",
+  "Write Python to convert 100 USD to EUR using a free API and run it",
+  "Remind me with a phone notification every hour to drink water",
 ];
 
 const TOOL_LABEL: Record<string, string> = {
   create_workflow: "Create workflow",
+  update_workflow: "Update workflow",
   run_workflow: "Run workflow",
   list_workflows: "List workflows",
   set_workflow_active: "Toggle workflow",
   list_runs: "List runs",
   n8n_list_workflows: "n8n: list workflows",
+  web_search: "Web search",
+  fetch_url: "Read web page",
+  http_request: "API request",
+  run_code: "Run code",
+  run_step: "Run action",
+  list_credentials: "Check credentials",
 };
 
 function TaskCard({ call }: { call: ToolCall }) {
@@ -37,7 +45,9 @@ function TaskCard({ call }: { call: ToolCall }) {
       ? "Executing..."
       : typeof call.result === "string"
         ? call.result
-        : call.result?.name
+        : call.result?.output !== undefined
+          ? String(call.result.output)
+          : call.result?.name
           ? `${call.result.name} (${call.result.steps ?? 0} steps)`
           : call.result?.status
             ? `Run ${call.result.status}`
@@ -134,6 +144,7 @@ export default function AgentScreen() {
         else if (e.type === "tool_result")
           update((m) => ({ ...m, tool_calls: m.tool_calls.map((c) => (c.id === e.call.id ? e.call : c)) }));
         else if (e.type === "error") toast(e.text, "error");
+        else if (e.type === "device_action") executeDeviceActions(e.actions, toast);
         else if (e.type === "done") update(() => e.message);
         scrollEnd();
       });

@@ -1,11 +1,24 @@
 import { fetch as expoFetch } from "expo/fetch";
 
+import { storage } from "@/src/utils/storage";
+
 export const BASE = process.env.EXPO_PUBLIC_BACKEND_URL as string;
 export const API = `${BASE}/api`;
 
-export type StepType = "http" | "llm" | "delay" | "set" | "filter";
+export type StepType =
+  | "http" | "llm" | "delay" | "set" | "filter" | "code" | "scrape" | "search" | "if" | "loop"
+  | "telegram" | "slack" | "discord" | "email" | "sheets" | "gmail" | "drive" | "calendar" | "device";
 export type Step = { id: string; type: StepType; name: string; config: Record<string, any> };
-export type Trigger = { type: "manual" | "schedule" | "webhook"; interval_minutes: number };
+export type Trigger = {
+  type: "manual" | "schedule" | "webhook" | "location";
+  interval_minutes: number;
+  latitude?: number | null;
+  longitude?: number | null;
+  radius?: number;
+  event?: "enter" | "exit";
+};
+export type DeviceAction = { action: "notify" | "clipboard" | "open_url" | "share" | "vibrate"; title: string; text: string; url: string };
+export type Credential = { id: string; name: string; type: string; created_at: string; fields: Record<string, string> };
 export type Workflow = {
   id: string;
   name: string;
@@ -36,6 +49,7 @@ export type Run = {
   input: string;
   output: string;
   logs: StepLog[];
+  device_actions: DeviceAction[];
   started_at: string;
   finished_at?: string | null;
 };
@@ -59,10 +73,26 @@ export type ChatMessage = {
 };
 export type N8nWorkflow = { id: string; name: string; active: boolean; updated_at?: string; nodes: number };
 
+// Per-install identity: every device keeps its own workflows, credentials and settings.
+const DEVICE_KEY = "automata_device_id";
+let devicePromise: Promise<string> | null = null;
+export function getDeviceId(): Promise<string> {
+  if (!devicePromise) {
+    devicePromise = (async () => {
+      const existing = await storage.secureGet(DEVICE_KEY, null);
+      if (existing) return String(existing);
+      const id = "dev-" + Array.from({ length: 32 }, () => Math.floor(Math.random() * 16).toString(16)).join("");
+      await storage.secureSet(DEVICE_KEY, id);
+      return id;
+    })();
+  }
+  return devicePromise;
+}
+
 export async function api<T>(path: string, opts: { method?: string; body?: any } = {}): Promise<T> {
   const res = await fetch(`${API}${path}`, {
     method: opts.method ?? "GET",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", "X-Device-Id": await getDeviceId() },
     body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
   });
   const text = await res.text();
@@ -76,12 +106,13 @@ export type AgentEvent =
   | { type: "tool_start"; call: ToolCall }
   | { type: "tool_result"; call: ToolCall }
   | { type: "error"; text: string }
+  | { type: "device_action"; actions: DeviceAction[] }
   | { type: "done"; message: ChatMessage };
 
 export async function streamAgent(message: string, onEvent: (e: AgentEvent) => void) {
   const res = await expoFetch(`${API}/agent/chat`, {
     method: "POST",
-    headers: { "Content-Type": "application/json", Accept: "text/event-stream" },
+    headers: { "Content-Type": "application/json", Accept: "text/event-stream", "X-Device-Id": await getDeviceId() },
     body: JSON.stringify({ message }),
   });
   if (!res.ok || !res.body) throw new Error(`Agent request failed (${res.status})`);
@@ -105,12 +136,26 @@ export async function streamAgent(message: string, onEvent: (e: AgentEvent) => v
   }
 }
 
-export const STEP_META: Record<StepType, { label: string; hint: string }> = {
-  http: { label: "HTTP Request", hint: "Call any API or URL" },
-  llm: { label: "AI Agent", hint: "Prompt an LLM with data" },
-  delay: { label: "Delay", hint: "Wait a few seconds" },
-  set: { label: "Set / Compose", hint: "Build text from templates" },
-  filter: { label: "Filter", hint: "Stop unless output matches" },
+export const STEP_META: Record<StepType, { label: string; hint: string; group: string }> = {
+  http: { label: "HTTP Request", hint: "Call any REST API, with a saved credential", group: "Core" },
+  llm: { label: "AI Agent", hint: "Prompt an LLM with data", group: "Core" },
+  code: { label: "Code (Python)", hint: "Run custom Python, set result", group: "Core" },
+  set: { label: "Set / Compose", hint: "Build text from templates", group: "Core" },
+  if: { label: "If / Else", hint: "Branch: stop or skip steps", group: "Logic" },
+  loop: { label: "Loop", hint: "Repeat the next step for each item", group: "Logic" },
+  filter: { label: "Filter", hint: "Stop unless output matches", group: "Logic" },
+  delay: { label: "Delay", hint: "Wait a few seconds", group: "Logic" },
+  scrape: { label: "Web Scraper", hint: "Read text from any web page", group: "Web" },
+  search: { label: "Web Search", hint: "Search the web", group: "Web" },
+  telegram: { label: "Telegram", hint: "Send a bot message", group: "Messaging" },
+  slack: { label: "Slack", hint: "Post via incoming webhook", group: "Messaging" },
+  discord: { label: "Discord", hint: "Post via channel webhook", group: "Messaging" },
+  email: { label: "Email (Resend)", hint: "Send email with your Resend key", group: "Messaging" },
+  sheets: { label: "Google Sheets", hint: "Read or append rows", group: "Google" },
+  gmail: { label: "Gmail", hint: "Send an email from your Gmail", group: "Google" },
+  drive: { label: "Google Drive", hint: "List or find files", group: "Google" },
+  calendar: { label: "Google Calendar", hint: "List or create events", group: "Google" },
+  device: { label: "Phone Action", hint: "Notify, copy, open link, share, vibrate", group: "Phone" },
 };
 
 export const MODELS: Record<Settings["emergent_provider"], string[]> = {

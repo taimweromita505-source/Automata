@@ -1,0 +1,33 @@
+{
+  "summary": "Iteration 2 — tested both backend and frontend for the new 'automate anything' features. All 32 pytest tests PASS: X-Device-Id header enforcement (missing/invalid/short -> 400, valid 8-64 [A-Za-z0-9-] ok), device isolation (device B cannot see device A workflows (404 on direct id) nor credentials), credentials vault (bearer create with masked fields in list, duplicate name 400, missing field 400, unknown type 400, name sanitation, delete), new step types (code result=2**10 -> 1024, code error -> failed gracefully, scrape HN titleline, search bing graceful, if stop + if skip with skip_count logs 'skipped', loop over JSON array with {{item}} template producing x=1,x=2,x=3, device notify populates run.device_actions, http+bearer credential sends Authorization header verified against httpbin.org/headers, telegram with fake creds fails gracefully no 500, missing credential clear error, {{cred.NAME.field}} template resolves inside set step), location trigger saves lat/lng/radius/event and run accepts trigger:location, GET /api/device/pending returns webhook-triggered device actions once then empty, agent SSE emits tool_start/tool_result for run_code and run_step with device_action events (no <tool> leakage in visible text). Regression: workflow list, toggle active with next_run_at, LLM test connection all green. Frontend (390x844): all 4 tabs render, Settings > Connections shows settings-credentials-link opening /credentials; credentials-add-button opens credential-sheet with 9 type chips (credential-type-Telegram/Slack/Discord/Email (Resend)/Google/Bearer token/API key header/Basic auth/Custom), credential-name-input + credential-field-<name> + credential-save-button all work; Settings shows Phone automations section with 'Status: unavailable' (web) — no crash. Workflow editor /workflow/new: editor-trigger-node opens Trigger sheet with trigger-type-manual/schedule/webhook/location; location shows trigger-latitude-input/trigger-longitude-input/trigger-radius-input; editor-add-step-button opens step-picker-sheet with all 19 expected step pickers (http, llm, code, set, if, loop, filter, delay, scrape, search, telegram, slack, discord, email, sheets, gmail, drive, calendar, device) grouped under CORE/LOGIC/WEB/MESSAGING/GOOGLE/PHONE; step-config-sheet renders step-field-<key> (e.g. step-field-code). editor-run-clipboard-button present. Agent tab shows new suggestion set (Telegram HN digest, python/USD->EUR, hourly water phone notification, AI news search).",
+  "backend_issues": {"critical": [], "minor": []},
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": [
+      {"screen": "Credentials add sheet", "issues": ["When type is pre-selected (Telegram default) the 'Missing field(s): bot_token, chat_id' validation banner is shown immediately before the user types anything — consider validating only on save press to avoid alarm."]}
+    ],
+    "react_native_issues": [
+      {"component": "expo-notifications web listener", "issue": "Console warning: '[expo-notifications] Listening to push token changes is not yet fully supported on web. Adding a listener will have no effect.' — expected on web preview; gate listener registration behind Platform.OS !== 'web' to silence."}
+    ]
+  },
+  "test_report_links": ["/app/backend/tests/backend_test.py", "/app/test_reports/pytest/pytest_results.xml"],
+  "action_items": [
+    "(Polish) Only show credential-sheet validation banner after the user tries to save, not on open.",
+    "(Polish) Gate expo-notifications push-token listener behind Platform.OS !== 'web' to clean the console warning on web.",
+    "(Future) server.py is 968 lines — split into modules (settings/workflows/credentials/agent/scheduler) when convenient."
+  ],
+  "critical_code_review_comments": [
+    "server.py has grown to ~968 lines — exceeds the 700-line soft cap; split into focused modules (workflows.py, agent.py, credentials.py, scheduler.py) in a future refactor.",
+    "@app.on_event startup/shutdown is deprecated in FastAPI — move to a lifespan context manager (still functional).",
+    "render() + TEMPLATE_RE use double braces {{...}}; the review request spelled it {cred.NAME.field} but the implementation (and tests) use {{cred.NAME.field}}. Everything works; this is just a doc-wording nuance.",
+    "connectors.run_code preexec_fn=_limits uses POSIX rlimit — works on Linux containers only; fine for current deploy."
+  ],
+  "updated_files": ["/app/backend/tests/backend_test.py"],
+  "success_rate": {"backend": "100% (32/32)", "frontend": "100% of flows tested (tabs, credentials screen open/add-sheet/types/fields/save-button, workflow editor trigger location with lat/lng/radius, step picker with all 19 step types grouped, step-config-sheet, agent tab suggestions)"},
+  "seed_data_creation": "Backend tests used two synthetic device IDs (random 20-char each) and created TEST_* workflows/credentials; all cleaned up at the end (test_zzz_cleanup). Settings restored to emergent/openai/gpt-5.4. No lingering data expected.",
+  "retest_needed": false,
+  "should_main_agent_self_test": false,
+  "context_for_next_testing_agent": "Backend tests at /app/backend/tests/backend_test.py are reusable; they generate per-session random X-Device-Id values and clean up. Frontend uses EXPO_PUBLIC_BACKEND_URL. Credential type chip testIDs use the UI *label* (not the server type), e.g. 'credential-type-Bearer token', 'credential-type-Email (Resend)', 'credential-type-API key header'. Step picker is inside the editor-add-step-button sheet (step-picker-sheet) and all step-picker-<type> items are visible there. Trigger location inputs are trigger-latitude-input / trigger-longitude-input / trigger-radius-input. The code template syntax is double-braces: {{cred.NAME.field}}, {{item}}, {{prev}}, etc.",
+  "rca_of_issue": "N/A — no failing cases."
+}

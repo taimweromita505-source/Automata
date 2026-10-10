@@ -1,7 +1,7 @@
 import { Image } from "expo-image";
 import { useFocusEffect, useRouter } from "expo-router";
 import * as Haptics from "expo-haptics";
-import { Clock, HandTap, Link, MagnifyingGlass, Plus, TreeStructure } from "phosphor-react-native";
+import { Clock, HandTap, Link, MagnifyingGlass, MapPin, Plus, TreeStructure } from "phosphor-react-native";
 import React, { useCallback, useState } from "react";
 import { ActivityIndicator, FlatList, Pressable, RefreshControl, Switch, Text, TextInput, View } from "react-native";
 import Animated, { FadeInDown } from "react-native-reanimated";
@@ -82,6 +82,8 @@ export default function WorkflowsScreen() {
   const triggerIcon = (t: string) =>
     t === "schedule" ? (
       <Clock size={18} color={colors.brandPrimary} />
+    ) : t === "location" ? (
+      <MapPin size={18} color={colors.brandPrimary} />
     ) : t === "webhook" ? (
       <Link size={18} color={colors.brandPrimary} />
     ) : (

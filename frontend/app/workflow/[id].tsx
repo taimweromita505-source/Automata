@@ -1,30 +1,32 @@
 import { useLocalSearchParams, useRouter } from "expo-router";
 import * as Haptics from "expo-haptics";
+import * as Clipboard from "expo-clipboard";
+import * as Location from "expo-location";
 import {
   ArrowDown,
   ArrowUp,
-  Brain,
   CaretLeft,
+  ClipboardText,
   Clock,
-  Funnel,
-  Globe,
   HandTap,
   Link,
+  MapPin,
   PencilSimple,
   Play,
   Plus,
-  TextT,
-  Timer,
   Trash,
 } from "phosphor-react-native";
 import React, { useEffect, useState } from "react";
-import { ActivityIndicator, Pressable, Switch, Text, View } from "react-native";
+import { ActivityIndicator, Linking, Platform, Pressable, Switch, Text, View } from "react-native";
 import { KeyboardAwareScrollView } from "react-native-keyboard-controller";
 import Animated, { FadeInDown, LinearTransition } from "react-native-reanimated";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
-import { api, BASE, Run, Step, STEP_META, StepType, Trigger, Workflow } from "@/src/api";
+import { api, BASE, Credential, Run, Step, STEP_META, StepType, Trigger, Workflow } from "@/src/api";
 import { RunLogs } from "@/src/components/run-logs";
+import { defaultConfig, StepForm, StepIcon, stepSummary } from "@/src/components/step-fields";
+import { executeDeviceActions } from "@/src/device";
+import { syncGeofences } from "@/src/geofence";
 import { useToast } from "@/src/components/toast";
 import { Badge, Button, Chips, Field, PressScale, Segmented, Sheet } from "@/src/components/ui";
 import { fonts, makeStyles, radius, spacing, useTheme } from "@/src/theme";
@@ -39,31 +41,7 @@ const EMPTY: Draft = {
   steps: [],
 };
 
-const DEFAULT_CONFIG: Record<StepType, Record<string, any>> = {
-  http: { method: "GET", url: "", headers: "", body: "" },
-  llm: { prompt: "Summarize this:\n{{prev}}", system: "" },
-  delay: { seconds: 5 },
-  set: { value: "{{prev}}" },
-  filter: { contains: "" },
-};
-
-function StepIcon({ type, color }: { type: StepType; color: string }) {
-  const p = { size: 20, color };
-  if (type === "http") return <Globe {...p} />;
-  if (type === "llm") return <Brain {...p} />;
-  if (type === "delay") return <Timer {...p} />;
-  if (type === "filter") return <Funnel {...p} />;
-  return <TextT {...p} />;
-}
-
-function stepSummary(s: Step) {
-  const c = s.config;
-  if (s.type === "http") return `${c.method ?? "GET"} ${c.url || "(no url)"}`;
-  if (s.type === "llm") return c.prompt || "(no prompt)";
-  if (s.type === "delay") return `Wait ${c.seconds ?? 0}s`;
-  if (s.type === "filter") return `Continue if contains "${c.contains ?? ""}"`;
-  return c.value || "(empty)";
-}
+const GROUPS = ["Core", "Logic", "Web", "Messaging", "Google", "Phone"];
 
 export default function WorkflowEditor() {
   const { id } = useLocalSearchParams<{ id: string }>();
@@ -85,6 +63,13 @@ export default function WorkflowEditor() {
   const [lastRun, setLastRun] = useState<Run | null>(null);
   const [runInput, setRunInput] = useState("");
   const [runSheet, setRunSheet] = useState(false);
+  const [credentials, setCredentials] = useState<Credential[]>([]);
+  const [locating, setLocating] = useState(false);
+  const [locBlocked, setLocBlocked] = useState(false);
+
+  useEffect(() => {
+    api<Credential[]>("/credentials").then(setCredentials).catch(() => {});
+  }, [editStep]);
 
   useEffect(() => {
     if (isNew) return;
@@ -120,6 +105,11 @@ export default function WorkflowEditor() {
       setWf(saved);
       Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
       toast("Workflow saved", "success");
+      if (saved.trigger.type === "location") {
+        syncGeofences().then((r) => {
+          if (!r.ok) toast(`${r.reason}. Enable location triggers in Settings.`, "info");
+        });
+      }
       if (isNew) router.replace(`/workflow/${saved.id}`);
       return saved.id;
     } catch (e: any) {
@@ -130,15 +120,17 @@ export default function WorkflowEditor() {
     }
   };
 
-  const run = async () => {
+  const run = async (fromClipboard = false) => {
     const wid = await save();
     if (!wid) return;
     setRunning(true);
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Heavy).catch(() => {});
     try {
-      const r = await api<Run>(`/workflows/${wid}/run`, { method: "POST", body: { input: runInput } });
+      const input = fromClipboard ? await Clipboard.getStringAsync().catch(() => "") : runInput;
+      const r = await api<Run>(`/workflows/${wid}/run`, { method: "POST", body: { input } });
       setLastRun(r);
       setRunSheet(true);
+      executeDeviceActions(r.device_actions, toast);
     } catch (e: any) {
       toast(e.message, "error");
     } finally {
@@ -163,7 +155,7 @@ export default function WorkflowEditor() {
   };
 
   const addStep = (type: StepType) => {
-    const step: Step = { id: Math.random().toString(36).slice(2, 10), type, name: STEP_META[type].label, config: { ...DEFAULT_CONFIG[type] } };
+    const step: Step = { id: Math.random().toString(36).slice(2, 10), type, name: STEP_META[type].label, config: defaultConfig(type) };
     setPicker(false);
     setWf({ ...wf, steps: [...wf.steps, step] });
     setTimeout(() => {
@@ -189,7 +181,29 @@ export default function WorkflowEditor() {
   };
 
   const setTrigger = (t: Partial<Trigger>) => setWf({ ...wf, trigger: { ...wf.trigger, ...t } });
-  const cfg = (patch: Record<string, any>) => editStep && setEditStep({ ...editStep, config: { ...editStep.config, ...patch } });
+  const pickMyLocation = async () => {
+    if (Platform.OS === "web") {
+      toast("Location triggers work in the installed app", "info");
+      return;
+    }
+    setLocating(true);
+    try {
+      let perm = await Location.getForegroundPermissionsAsync();
+      if (!perm.granted && perm.canAskAgain) perm = await Location.requestForegroundPermissionsAsync();
+      if (!perm.granted) {
+        setLocBlocked(!perm.canAskAgain);
+        toast("Location permission is needed to pick this place", "error");
+        return;
+      }
+      setLocBlocked(false);
+      const pos = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Balanced });
+      setTrigger({ latitude: pos.coords.latitude, longitude: pos.coords.longitude });
+    } catch {
+      toast("Could not get your location", "error");
+    } finally {
+      setLocating(false);
+    }
+  };
 
   if (loading) {
     return (
@@ -200,7 +214,15 @@ export default function WorkflowEditor() {
   }
 
   const trig = wf.trigger;
-  const TrigIcon = trig.type === "schedule" ? Clock : trig.type === "webhook" ? Link : HandTap;
+  const TrigIcon = trig.type === "schedule" ? Clock : trig.type === "webhook" ? Link : trig.type === "location" ? MapPin : HandTap;
+  const trigTitle =
+    trig.type === "manual"
+      ? "Manual / app link"
+      : trig.type === "schedule"
+        ? `Every ${trig.interval_minutes} min`
+        : trig.type === "webhook"
+          ? "Webhook"
+          : `On ${trig.event ?? "enter"} · ${trig.radius ?? 200}m`;
 
   return (
     <View style={styles.root}>
@@ -247,9 +269,7 @@ export default function WorkflowEditor() {
           </View>
           <View style={{ flex: 1 }}>
             <Text style={styles.nodeKind}>TRIGGER</Text>
-            <Text style={styles.nodeTitle}>
-              {trig.type === "manual" ? "Manual run" : trig.type === "schedule" ? `Every ${trig.interval_minutes} min` : "Webhook"}
-            </Text>
+            <Text style={styles.nodeTitle}>{trigTitle}</Text>
           </View>
           <PencilSimple size={18} color={colors.muted} />
         </PressScale>
@@ -308,9 +328,12 @@ export default function WorkflowEditor() {
 
       <View style={[styles.footer, { paddingBottom: insets.bottom + spacing.md }]}>
         <Button title="Save" variant="secondary" onPress={save} loading={saving} style={{ flex: 1 }} testID="editor-save-button" />
+        <Pressable onPress={() => run(true)} disabled={running} style={styles.clipBtn} testID="editor-run-clipboard-button">
+          <ClipboardText size={22} color={colors.onSurface} />
+        </Pressable>
         <Button
           title="Run"
-          onPress={run}
+          onPress={() => run()}
           loading={running}
           style={{ flex: 1 }}
           icon={<Play size={18} color={colors.onBrandPrimary} weight="fill" />}
@@ -320,16 +343,23 @@ export default function WorkflowEditor() {
 
       {/* Step type picker */}
       <Sheet visible={picker} onClose={() => setPicker(false)} title="Add a step" testID="step-picker-sheet">
-        {(Object.keys(STEP_META) as StepType[]).map((t) => (
-          <Pressable key={t} style={styles.pickRow} onPress={() => addStep(t)} testID={`step-picker-${t}`}>
-            <View style={styles.nodeIcon}>
-              <StepIcon type={t} color={colors.brandPrimary} />
-            </View>
-            <View style={{ flex: 1 }}>
-              <Text style={styles.nodeTitle}>{STEP_META[t].label}</Text>
-              <Text style={styles.nodeSummary}>{STEP_META[t].hint}</Text>
-            </View>
-          </Pressable>
+        {GROUPS.map((g) => (
+          <View key={g}>
+            <Text style={styles.groupLabel}>{g.toUpperCase()}</Text>
+            {(Object.keys(STEP_META) as StepType[])
+              .filter((t) => STEP_META[t].group === g)
+              .map((t) => (
+                <Pressable key={t} style={styles.pickRow} onPress={() => addStep(t)} testID={`step-picker-${t}`}>
+                  <View style={styles.nodeIcon}>
+                    <StepIcon type={t} color={colors.brandPrimary} />
+                  </View>
+                  <View style={{ flex: 1 }}>
+                    <Text style={styles.nodeTitle}>{STEP_META[t].label}</Text>
+                    <Text style={styles.nodeSummary}>{STEP_META[t].hint}</Text>
+                  </View>
+                </Pressable>
+              ))}
+          </View>
         ))}
       </Sheet>
 
@@ -349,9 +379,53 @@ export default function WorkflowEditor() {
             { value: "manual", label: "Manual" },
             { value: "schedule", label: "Schedule" },
             { value: "webhook", label: "Webhook" },
+            { value: "location", label: "Place" },
           ]}
         />
         <View style={{ height: spacing.lg }} />
+        {trig.type === "location" && (
+          <>
+            <Text style={styles.nodeSummary}>
+              Runs when your phone enters or leaves a place. Needs the installed app with background location allowed (Settings tab).
+            </Text>
+            <View style={{ height: spacing.md }} />
+            <Text style={styles.sheetLabel}>EVENT</Text>
+            <Chips testID="trigger-location-event" options={["enter", "exit"]} value={trig.event ?? "enter"} onChange={(v) => setTrigger({ event: v as "enter" | "exit" })} />
+            <Button
+              title={trig.latitude != null ? "Update to my location" : "Use my current location"}
+              variant="secondary"
+              onPress={pickMyLocation}
+              loading={locating}
+              icon={<MapPin size={18} color={colors.onSurface} />}
+              testID="trigger-use-location-button"
+            />
+            {locBlocked && (
+              <Button title="Open settings" variant="ghost" onPress={() => Linking.openSettings()} style={{ marginTop: spacing.sm }} testID="trigger-location-open-settings" />
+            )}
+            <View style={{ height: spacing.lg }} />
+            <Field
+              label="Latitude"
+              value={trig.latitude != null ? String(trig.latitude) : ""}
+              onChangeText={(v) => setTrigger({ latitude: v === "" || isNaN(Number(v)) ? null : Number(v) })}
+              keyboardType="numbers-and-punctuation"
+              testID="trigger-latitude-input"
+            />
+            <Field
+              label="Longitude"
+              value={trig.longitude != null ? String(trig.longitude) : ""}
+              onChangeText={(v) => setTrigger({ longitude: v === "" || isNaN(Number(v)) ? null : Number(v) })}
+              keyboardType="numbers-and-punctuation"
+              testID="trigger-longitude-input"
+            />
+            <Field
+              label="Radius (meters, min 100)"
+              value={String(trig.radius ?? 200)}
+              onChangeText={(v) => setTrigger({ radius: parseInt(v || "0", 10) || 0 })}
+              keyboardType="number-pad"
+              testID="trigger-radius-input"
+            />
+          </>
+        )}
         {trig.type === "schedule" && (
           <>
             <Text style={styles.sheetLabel}>INTERVAL</Text>
@@ -380,7 +454,15 @@ export default function WorkflowEditor() {
             <Text style={styles.nodeSummary}>Request body becomes {"{{input}}"}. Workflow must be Active.</Text>
           </View>
         )}
-        {trig.type === "manual" && <Text style={styles.nodeSummary}>Run from the editor or ask the Agent to run it.</Text>}
+        {trig.type === "manual" && (
+          <View style={styles.hookBox} testID="trigger-app-link">
+            <Text style={styles.sheetLabel}>APP LINK (SHORTCUTS / TASKER / NFC)</Text>
+            <Text style={styles.mono} selectable>
+              {wf.id ? `automata://run/${wf.id}?input=hello` : "Save the workflow to get its app link"}
+            </Text>
+            <Text style={styles.nodeSummary}>Run from the editor, ask the Agent, or open this link from any phone automation app.</Text>
+          </View>
+        )}
       </Sheet>
 
       {/* Step config */}
@@ -399,37 +481,16 @@ export default function WorkflowEditor() {
         {editStep && (
           <>
             <Field label="Step name" value={editStep.name} onChangeText={(v) => setEditStep({ ...editStep, name: v })} autoCapitalize="sentences" testID="step-name-input" />
-            {editStep.type === "http" && (
-              <>
-                <Text style={styles.sheetLabel}>METHOD</Text>
-                <Chips testID="step-http-method" options={["GET", "POST", "PUT", "DELETE"]} value={editStep.config.method} onChange={(v) => cfg({ method: v })} />
-                <Field label="URL" value={editStep.config.url} onChangeText={(v) => cfg({ url: v })} placeholder="https://api.example.com/data" keyboardType="url" testID="step-http-url-input" />
-                <Field label="Headers (JSON)" value={editStep.config.headers} onChangeText={(v) => cfg({ headers: v })} placeholder='{"Authorization": "Bearer ..."}' testID="step-http-headers-input" />
-                <Field label="Body" value={editStep.config.body} onChangeText={(v) => cfg({ body: v })} placeholder='{"text": "{{prev}}"}' multiline testID="step-http-body-input" />
-              </>
-            )}
-            {editStep.type === "llm" && (
-              <>
-                <Field label="Prompt" value={editStep.config.prompt} onChangeText={(v) => cfg({ prompt: v })} multiline autoCapitalize="sentences" testID="step-llm-prompt-input" />
-                <Field label="System instructions (optional)" value={editStep.config.system} onChangeText={(v) => cfg({ system: v })} multiline autoCapitalize="sentences" testID="step-llm-system-input" />
-              </>
-            )}
-            {editStep.type === "delay" && (
-              <Field
-                label="Seconds (max 60)"
-                value={String(editStep.config.seconds ?? 0)}
-                onChangeText={(v) => cfg({ seconds: Math.min(60, parseInt(v || "0", 10) || 0) })}
-                keyboardType="number-pad"
-                testID="step-delay-seconds-input"
-              />
-            )}
-            {editStep.type === "set" && (
-              <Field label="Value" value={editStep.config.value} onChangeText={(v) => cfg({ value: v })} multiline testID="step-set-value-input" />
-            )}
-            {editStep.type === "filter" && (
-              <Field label="Continue only if output contains" value={editStep.config.contains} onChangeText={(v) => cfg({ contains: v })} testID="step-filter-contains-input" />
-            )}
-            <Text style={styles.nodeSummary}>{"Templates: {{input}} {{prev}} {{step_1}} {{now}}"}</Text>
+            <StepForm
+              step={editStep}
+              credentials={credentials}
+              onChange={(config) => setEditStep({ ...editStep, config })}
+              onOpenVault={() => {
+                commitStep();
+                router.push("/credentials");
+              }}
+            />
+            <Text style={styles.nodeSummary}>{"Templates: {{input}} {{prev}} {{step_1}} {{item}} {{now}} {{cred.NAME.field}}"}</Text>
           </>
         )}
       </Sheet>
@@ -525,6 +586,17 @@ const useStyles = makeStyles((c) => ({
     borderColor: c.border,
     marginBottom: spacing.sm,
     backgroundColor: c.surface,
+  },
+  groupLabel: { color: c.brandPrimary, fontFamily: fonts.display, fontSize: 13, letterSpacing: 1.5, marginTop: spacing.md, marginBottom: spacing.sm },
+  clipBtn: {
+    width: 48,
+    height: 48,
+    borderRadius: radius.md,
+    borderWidth: 1,
+    borderColor: c.border,
+    backgroundColor: c.surfaceTertiary,
+    alignItems: "center",
+    justifyContent: "center",
   },
   sheetLabel: { color: c.onSurfaceTertiary, fontFamily: fonts.displaySemi, fontSize: 13, letterSpacing: 1, marginBottom: spacing.sm },
   sheetFooter: { flexDirection: "row", gap: spacing.md },

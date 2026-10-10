@@ -1,14 +1,18 @@
-import { useFocusEffect } from "expo-router";
+import { useFocusEffect, useRouter } from "expo-router";
 import * as Haptics from "expo-haptics";
-import { Cloud, Cpu, Plugs } from "phosphor-react-native";
+import * as Location from "expo-location";
+import { Bell, CaretRight, Cloud, Cpu, Key, MapPin, Plugs } from "phosphor-react-native";
 import React, { useCallback, useState } from "react";
-import { ActivityIndicator, Text, View } from "react-native";
+import { ActivityIndicator, Platform, Pressable, Text, View } from "react-native";
 import { KeyboardAwareScrollView } from "react-native-keyboard-controller";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 import { api, MODELS, N8nWorkflow, Settings } from "@/src/api";
+import { PermissionSheet } from "@/src/components/permission-sheet";
 import { useToast } from "@/src/components/toast";
 import { Button, Chips, Field, SectionLabel, Segmented } from "@/src/components/ui";
+import { getNotificationPermission, requestNotificationPermission } from "@/src/device";
+import { syncGeofences } from "@/src/geofence";
 import { usesNativeTabs } from "@/src/navigation";
 import { fonts, makeStyles, radius, spacing, useTheme } from "@/src/theme";
 
@@ -29,6 +33,60 @@ export default function SettingsScreen() {
   const [testing, setTesting] = useState(false);
   const [testingN8n, setTestingN8n] = useState(false);
   const [testResult, setTestResult] = useState<{ ok: boolean; text: string } | null>(null);
+  const router = useRouter();
+  const [notifStatus, setNotifStatus] = useState<"granted" | "denied" | "blocked" | "undetermined" | "unavailable">("undetermined");
+  const [locStatus, setLocStatus] = useState<string>("off");
+  const [permSheet, setPermSheet] = useState<null | "notifications" | "location">(null);
+  const [locBlocked, setLocBlocked] = useState(false);
+
+  const refreshPerms = useCallback(async () => {
+    if (Platform.OS === "web") {
+      setNotifStatus("unavailable");
+      setLocStatus("unavailable");
+      return;
+    }
+    const n = await getNotificationPermission();
+    setNotifStatus(n.granted ? "granted" : n.canAskAgain ? (n.status === "undetermined" ? "undetermined" : "denied") : "blocked");
+    const bg = await Location.getBackgroundPermissionsAsync();
+    setLocStatus(bg.granted ? "on" : "off");
+    setLocBlocked(!bg.granted && !bg.canAskAgain && bg.status !== "undetermined");
+  }, []);
+
+  useFocusEffect(
+    useCallback(() => {
+      refreshPerms();
+    }, [refreshPerms]),
+  );
+
+  const allowNotifications = async () => {
+    setPermSheet(null);
+    const r = await requestNotificationPermission();
+    await refreshPerms();
+    toast(r.granted ? "Notifications enabled" : "Notifications not allowed", r.granted ? "success" : "error");
+  };
+
+  const allowLocation = async () => {
+    setPermSheet(null);
+    try {
+      let fg = await Location.getForegroundPermissionsAsync();
+      if (!fg.granted && fg.canAskAgain) fg = await Location.requestForegroundPermissionsAsync();
+      if (!fg.granted) {
+        toast("Location not allowed", "error");
+        return refreshPerms();
+      }
+      let bg = await Location.getBackgroundPermissionsAsync();
+      if (!bg.granted && bg.canAskAgain) bg = await Location.requestBackgroundPermissionsAsync();
+      await refreshPerms();
+      if (!bg.granted) {
+        toast("Choose 'Allow all the time' to run place triggers", "error");
+        return;
+      }
+      const res = await syncGeofences();
+      toast(res.ok ? `Location triggers on (${res.count} place${res.count === 1 ? "" : "s"})` : res.reason ?? "Failed", res.ok ? "success" : "error");
+    } catch {
+      toast("Location triggers need the installed app build", "error");
+    }
+  };
 
   useFocusEffect(
     useCallback(() => {
@@ -183,6 +241,43 @@ export default function SettingsScreen() {
           )}
         </View>
 
+        <SectionLabel>Connections</SectionLabel>
+        <Pressable style={[styles.card, styles.linkRow]} onPress={() => router.push("/credentials")} testID="settings-credentials-link">
+          <Key size={20} color={colors.brandPrimary} />
+          <View style={{ flex: 1 }}>
+            <Text style={styles.rowTitle}>Credentials vault</Text>
+            <Text style={styles.info}>Your own keys: Telegram, Slack, Discord, Email, Google, any API</Text>
+          </View>
+          <CaretRight size={18} color={colors.muted} />
+        </Pressable>
+
+        <SectionLabel>Phone automations</SectionLabel>
+        <View style={styles.card}>
+          <View style={styles.permRow}>
+            <Bell size={20} color={colors.brandPrimary} />
+            <View style={{ flex: 1 }}>
+              <Text style={styles.rowTitle}>Notifications</Text>
+              <Text style={styles.info} testID="settings-notifications-status">{`Status: ${notifStatus}`}</Text>
+            </View>
+            {notifStatus !== "granted" && notifStatus !== "unavailable" && (
+              <Button title="Enable" variant="secondary" onPress={() => setPermSheet("notifications")} testID="settings-enable-notifications-button" />
+            )}
+          </View>
+          <View style={[styles.permRow, { marginTop: spacing.lg }]}>
+            <MapPin size={20} color={colors.brandPrimary} />
+            <View style={{ flex: 1 }}>
+              <Text style={styles.rowTitle}>Place triggers</Text>
+              <Text style={styles.info} testID="settings-location-status">{`Background location: ${locStatus}`}</Text>
+            </View>
+            {locStatus !== "unavailable" && (
+              <Button title={locStatus === "on" ? "Sync" : "Enable"} variant="secondary" onPress={() => (locStatus === "on" ? allowLocation() : setPermSheet("location"))} testID="settings-enable-location-button" />
+            )}
+          </View>
+          <Text style={[styles.info, { marginTop: spacing.lg }]}>
+            Phone actions and place triggers work in the installed app (APK). Expo Go and the web preview have limited support. Android may delay background events to save battery.
+          </Text>
+        </View>
+
         <SectionLabel>n8n Connection (optional)</SectionLabel>
         <View style={styles.card}>
           <View style={styles.infoRow}>
@@ -210,6 +305,24 @@ export default function SettingsScreen() {
 
         <Button title="Save configuration" onPress={() => save()} loading={saving} testID="settings-save-button" style={{ marginTop: spacing.sm }} />
       </KeyboardAwareScrollView>
+      <PermissionSheet
+        visible={permSheet === "notifications"}
+        title="Allow notifications"
+        benefit="Your workflows can alert you the moment something happens: a price drop, a new email, a finished report."
+        blocked={notifStatus === "blocked"}
+        onAllow={allowNotifications}
+        onClose={() => setPermSheet(null)}
+        testID="notifications-permission-sheet"
+      />
+      <PermissionSheet
+        visible={permSheet === "location"}
+        title="Allow place triggers"
+        benefit="Run automations when you arrive at or leave a place, like home or work. Choose 'Allow all the time' so it works when the app is closed. Your location is only checked by your phone."
+        blocked={locBlocked}
+        onAllow={allowLocation}
+        onClose={() => setPermSheet(null)}
+        testID="location-permission-sheet"
+      />
     </View>
   );
 }
@@ -238,4 +351,7 @@ const useStyles = makeStyles((c) => ({
     marginBottom: spacing.sm,
   },
   testResult: { fontFamily: fonts.mono, fontSize: 12, marginTop: spacing.md },
+  linkRow: { flexDirection: "row", alignItems: "center", gap: spacing.md },
+  permRow: { flexDirection: "row", alignItems: "center", gap: spacing.md },
+  rowTitle: { color: c.onSurface, fontFamily: fonts.display, fontSize: 17 },
 }));

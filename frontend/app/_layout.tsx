@@ -4,14 +4,31 @@ import { Stack } from "expo-router";
 import * as SplashScreen from "expo-splash-screen";
 import { StatusBar } from "expo-status-bar";
 import { useEffect } from "react";
-import { LogBox } from "react-native";
+import { AppState, LogBox } from "react-native";
 import { GestureHandlerRootView } from "react-native-gesture-handler";
 import { KeyboardProvider } from "react-native-keyboard-controller";
 
 import { ErrorBoundary } from "@/src/components/error-boundary";
-import { ToastProvider } from "@/src/components/toast";
+import { ToastProvider, useToast } from "@/src/components/toast";
+import { deliverPendingActions } from "@/src/device";
+import "@/src/geofence";
 import { queryClient } from "@/src/query-client";
 import { useTheme } from "@/src/theme";
+
+/** Delivers phone actions (notifications etc.) queued by scheduled / webhook runs. */
+function PendingActions() {
+  const toast = useToast();
+  useEffect(() => {
+    deliverPendingActions(toast);
+    const sub = AppState.addEventListener("change", (s) => s === "active" && deliverPendingActions(toast));
+    const timer = setInterval(() => AppState.currentState === "active" && deliverPendingActions(toast), 60000);
+    return () => {
+      sub.remove();
+      clearInterval(timer);
+    };
+  }, [toast]);
+  return null;
+}
 
 // Disable logbox errors etc so that users can see the app
 // and agent works as expected.
@@ -44,6 +61,7 @@ export default function RootLayout() {
           <KeyboardProvider>
             <ToastProvider>
               <StatusBar style="light" />
+              <PendingActions />
               <Stack screenOptions={{ headerShown: false, contentStyle: { backgroundColor: colors.surface } }} />
             </ToastProvider>
           </KeyboardProvider>
