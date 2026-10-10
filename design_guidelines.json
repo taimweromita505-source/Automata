@@ -1,0 +1,152 @@
+{
+  "app_name": "Automata (n8n Mobile Agent)",
+  "personality": "7 Dark-First Utility DARK",
+  "personality_one_liner": "A sharp, responsive, tactical command-center designed for rapid workflow automation and AI task execution.",
+  "color": {
+    "surface": "#0D0D0D",
+    "onSurface": "#F2F2F2",
+    "surfaceSecondary": "#1A1A1A",
+    "onSurfaceSecondary": "#CCCCCC",
+    "surfaceTertiary": "#262626",
+    "onSurfaceTertiary": "#B3B3B3",
+    "surfaceInverse": "#E6E6E6",
+    "onSurfaceInverse": "#0D0D0D",
+    "brand": "#FF6B00",
+    "brandPrimary": "#FF6B00",
+    "onBrandPrimary": "#000000",
+    "brandSecondary": "#CC5500",
+    "onBrandSecondary": "#F2F2F2",
+    "brandTertiary": "#4D2200",
+    "onBrandTertiary": "#FFB84D",
+    "success": "#00E676",
+    "onSuccess": "#000000",
+    "warning": "#FFC400",
+    "onWarning": "#000000",
+    "error": "#FF3D00",
+    "onError": "#FFFFFF",
+    "border": "#333333",
+    "borderStrong": "#4D4D4D",
+    "divider": "#1A1A1A",
+    "muted": "#808080",
+    "onBrand": "#000000"
+  },
+  "typography": {
+    "displayFontFamily": "Rajdhani",
+    "textFontFamily": "IBM Plex Sans",
+    "scale": {
+      "sm": 12,
+      "base": 14,
+      "lg": 16,
+      "xl": 20,
+      "2xl": 24
+    }
+  },
+  "spacing": {
+    "rule": "Handle spacing correctly dont have extra spaces where its not required, handle padding and margin corectly and subtle for buttons and components",
+    "xs": 4,
+    "sm": 8,
+    "md": 12,
+    "lg": 16,
+    "xl": 24,
+    "2xl": 32,
+    "3xl": 48
+  },
+  "radius_tokens": {
+    "sm": 4,
+    "md": 6,
+    "lg": 8,
+    "pill": 999
+  },
+  "shadow_tier": "0",
+  "navigation": "bottom_tabs",
+  "icon_set": "Phosphor",
+  "glassmorphism": {
+    "enabled": false,
+    "do's": [
+      "Use solid surfaceSecondary with border for elevated surfaces"
+    ],
+    "dont's": [
+      "Do not use blur or glass effects (clashes with the sharp, tactical utility aesthetic)"
+    ]
+  },
+  "platform_libraries": {
+    "glass": {
+      "ios": "solid surfaceSecondary",
+      "android": "solid surfaceSecondary",
+      "low_end_android_fallback": "solid surfaceSecondary"
+    },
+    "image": "expo-image",
+    "blur": "expo-blur",
+    "bottom_sheet": "@gorhom/bottom-sheet",
+    "animation": "react-native-reanimated",
+    "gesture": "react-native-gesture-handler"
+  },
+  "screens": [
+    {
+      "name": "Agent",
+      "purpose": "A chat interface for interacting with the AI agent, displaying inline tool execution cards.",
+      "states": {
+        "loading": "Subtle pulse on the input area",
+        "empty": "Empty chat with suggested prompt pills (e.g., 'Run daily report', 'Create webhook workflow')",
+        "error": "Failed tool execution card with red status badge and retry button"
+      },
+      "layout": "Standard chat layout (messages in ScrollView, sticky input at bottom). AI messages are left-aligned, user right-aligned. Crucially, when AI executes a tool (n8n workflow), inject a 'Task Card' (surfaceSecondary block, border, status badge: Running/Completed) into the chat stream."
+    },
+    {
+      "name": "Workflows",
+      "purpose": "List of all automated workflows with quick active/inactive toggles.",
+      "states": {
+        "loading": "Stacked skeleton cards",
+        "empty": "Illustration of connected nodes + 'No workflows yet' + CTA to create",
+        "error": "Error message with 'Retry Connection' button"
+      },
+      "layout": "Search bar at top. Vertical list of workflow cards. Card layout: Title, Trigger icon, Next run / Last run timestamp, and an active/inactive switch. FAB floating bottom right for 'New Workflow'."
+    },
+    {
+      "name": "WorkflowEditor",
+      "purpose": "Vertical node chain builder for creating/editing a workflow.",
+      "states": {
+        "loading": "Centered spinner",
+        "empty": "Not applicable (always starts with Trigger node)",
+        "error": "Validation error banner at the top of the canvas"
+      },
+      "layout": "Vertical node chain (not 2D canvas). Starts with Trigger block. A vertical line connects down to a '+' icon, then to the next Action block (e.g., HTTP, LLM, Webhook). Tapping a node opens a bottom sheet with its configuration form. Sticky 'Save' button at the bottom."
+    },
+    {
+      "name": "Runs",
+      "purpose": "Execution history showing success/failure of recent workflow runs.",
+      "states": {
+        "loading": "Skeleton list",
+        "empty": "No runs yet message",
+        "error": "Failed to load runs banner"
+      },
+      "layout": "Command-center style list. Each row shows Workflow Name, Timestamp, and a hard status badge (Success: green, Failed: red). Tapping expands the row to show a console-like log view (surfaceTertiary background, mono text)."
+    },
+    {
+      "name": "Settings",
+      "purpose": "Configure LLM providers, local endpoints, and external n8n instance.",
+      "states": {
+        "loading": "Loading skeleton for settings",
+        "empty": "N/A",
+        "error": "Validation error on API key inputs"
+      },
+      "layout": "Form-heavy layout. Grouped sections (LLM Provider, n8n Connection). Use segmented controls to toggle between 'Cloud API' (OpenAI/Claude) and 'Local' (Ollama). Clean input fields with borders. Sticky 'Save Configuration' button."
+    }
+  ],
+  "images": {
+    "empty_workflows": {
+      "url": "https://images.unsplash.com/photo-1518770660439-4636190af475?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NTYxODF8MHwxfHNlYXJjaHwxfHxjaXJjdWl0JTIwYm9hcmQlMjBkYXJrfGVufDB8fHx8MTc5MTY0NTkzNXww&ixlib=rb-4.1.0&q=85",
+      "dark": "https://images.unsplash.com/photo-1518770660439-4636190af475?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NTYxODF8MHwxfHNlYXJjaHwxfHxjaXJjdWl0JTIwYm9hcmQlMjBkYXJrfGVufDB8fHx8MTc5MTY0NTkzNXww&ixlib=rb-4.1.0&q=85",
+      "alt": "Abstract circuit board representing automation"
+    }
+  },
+  "instructions_to_main_agent": [
+    "Strictly follow the Dark-First Utility DARK guidelines. Do not use blue or purple anywhere. Use the defined #FF6B00 (Amber) for primary actions.",
+    "For the Workflow Editor, implement a vertical list of nodes connected by a centered vertical line instead of a free-floating 2D canvas. This is crucial for a native mobile experience.",
+    "Use Phosphor icons with a consistent weight (either all outlined or all filled per screen context).",
+    "Tool execution cards in the Chat Agent must look like distinct tactical blocks (surfaceSecondary, 1px border) with clear status indicators (Running/Success/Failed) so they stand out from normal conversation.",
+    "Do not use glassmorphism or blur effects. The app should feel sharp, mechanical, and tactical. Rely on 1px borders (#333333) and surface elevation for separation.",
+    "Add firm haptic feedback on node reordering, drag/drop, and workflow execution triggers.",
+    "Avoid emoji entirely across the system UI."
+  ]
+}

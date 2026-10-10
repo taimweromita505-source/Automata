@@ -1,0 +1,30 @@
+{
+  "summary": "First test iteration — tested BOTH backend and frontend. All 21 pytest backend tests pass covering: settings get/put, LLM test (emergent ok + local invalid error), workflows CRUD + run (set, http, invalid http, filter stop, llm, schedule next_run_at, toggle active, webhook requires active+webhook trigger), runs list/clear, agent messages list/clear, agent chat SSE with tool calls (create_workflow + run_workflow verified, no <tool> leakage in visible content), and external n8n (400 unconfigured, 502 unreachable). Frontend tested on 390x844 viewport: all 4 tabs (tab-agent/workflows/runs/settings) render, agent suggestions appear on empty state (after clear) and chat produces streaming reply + task cards, workflows list with search/toggle/segmented mode works and n8n mode shows 'Not connected' empty state, editor flow (name, trigger sheet with manual/schedule/webhook, step picker set, step-config-sheet, apply, save, run) completes with run-result-sheet showing SUCCESS, runs tab expands rows with step logs, settings shows provider/model chips and 'Test connection' returns 'Connected. Reply: OK'. Settings restored to provider=emergent, emergent_provider=openai, emergent_model=gpt-5.4 at the end. Database cleaned: all TEST_ workflows, runs, and messages removed.",
+  "backend_issues": {"critical": [], "minor": []},
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": [
+      {"screen": "Workflows (n8n mode, not configured)", "issues": ["Backend returns 400 which is logged as a browser console error ('Failed to load resource: 400'). UI handles it with 'Not connected' empty-state (nice) but the raw 400 noise in console could be suppressed by checking n8n_url presence client-side before calling GET /api/n8n/workflows, or by using a 200 payload with configured:false."]}
+    ],
+    "react_native_issues": [
+      {"component": "View/Pressable props.pointerEvents", "issue": "Console warning: 'props.pointerEvents is deprecated. Use style.pointerEvents'. Likely comes from a library (expo-router/react-native-reanimated) or an in-app component. Non-blocking but should be migrated to style.pointerEvents when upgrading RN."}
+    ]
+  },
+  "test_report_links": ["/app/backend/tests/backend_test.py", "/app/test_reports/pytest/pytest_results.xml"],
+  "action_items": [
+    "(Optional polish) Hide the n8n GET call when n8n_url/api_key empty, or have backend return 200 with configured:false, to avoid the 400 console error on first app load.",
+    "(Minor) Investigate the 'props.pointerEvents is deprecated' warning and migrate to style.pointerEvents (likely inside app code since it appears post app-boot)."
+  ],
+  "critical_code_review_comments": [
+    "server.py is 668 lines — approaching the 700-line soft limit; consider splitting into modules (settings.py, workflows.py, agent.py, n8n.py, scheduler.py) in the next iteration.",
+    "@app.on_event('startup'/'shutdown') is deprecated in FastAPI; switch to a lifespan context manager."
+  ],
+  "updated_files": ["/app/backend/tests/backend_test.py", "/app/backend/tests/__init__.py"],
+  "success_rate": {"backend": "100% (21/21)", "frontend": "100% of flows tested (tabs, agent suggestions+chat+tool exec, workflow editor create/save/run, runs expand, settings test connection)"},
+  "seed_data_creation": "Backend tests created TEST_* workflows/runs/messages for validation; all cleaned up at the end. Settings restored to provider=emergent, openai, gpt-5.4. Database currently only contains the pre-existing 'HN front page summary' seed workflow.",
+  "retest_needed": false,
+  "should_main_agent_self_test": false,
+  "context_for_next_testing_agent": "Pytest file at /app/backend/tests/backend_test.py is reusable. Use EXPO_PUBLIC_BACKEND_URL (not EXPO_BACKEND_URL — this repo uses the EXPO_PUBLIC_ prefix). Frontend uses testIDs consistently; tab buttons use tabBarButtonTestID (tab-agent/tab-workflows/tab-runs/tab-settings). Agent chat is SSE on POST /api/agent/chat and takes 10-60s per turn; verify no <tool> blocks leak into delta events. Scheduler bumps next_run_at every 20s, so TEST_sched workflows should be deleted quickly to avoid background runs.",
+  "rca_of_issue": "N/A — no failing cases."
+}
