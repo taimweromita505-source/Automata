@@ -7,7 +7,7 @@ import { KeyboardAvoidingView } from "react-native-keyboard-controller";
 import Animated, { FadeInDown } from "react-native-reanimated";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
-import { api, ChatMessage, Settings, streamAgent, ToolCall } from "@/src/api";
+import { api, ChatMessage, ProRequiredError, Settings, streamAgent, ToolCall } from "@/src/api";
 import { useToast } from "@/src/components/toast";
 import { executeDeviceActions } from "@/src/device";
 import { usesNativeTabs } from "@/src/navigation";
@@ -174,6 +174,12 @@ export default function AgentScreen() {
         scrollEnd();
       });
     } catch (err: any) {
+      if (err instanceof ProRequiredError) {
+        // The server enforces the free limit; the paywall is already open. Drop the unsent bubbles.
+        setMessages((p) => p.filter((m) => m.id !== draftId && m.created_at !== now));
+        setInput(msg);
+        return;
+      }
       toast(err?.message ?? "Agent failed", "error");
       update((m) => ({ ...m, content: m.content || "Request failed. Check your connection and LLM settings." }));
     } finally {

@@ -17,8 +17,10 @@ from typing import List, Optional, Any, Annotated, Literal, AsyncIterator
 from datetime import datetime, timezone, timedelta
 import httpx
 from emergentintegrations.llm.chat import LlmChat, UserMessage, TextDelta, StreamDone
+import billing
 import connectors
 import vault
+from billing import ProRequired
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
@@ -184,6 +186,13 @@ async def get_settings(device: str) -> Settings:
     return Settings(**(doc or {}))
 
 
+async def guard_llm(settings: Settings, device: str, pro: bool) -> None:
+    """Call before every LLM request: Local LLM is Pro-only; server-paid calls count toward the daily cap."""
+    billing.check_local_llm(settings.provider, pro)
+    if settings.provider == "emergent":
+        await billing.consume_llm(db, device)
+
+
 @api_router.get("/settings")
 async def read_settings(device: str = Depends(get_device)):
     return (await get_settings(device)).model_dump()
@@ -191,6 +200,7 @@ async def read_settings(device: str = Depends(get_device)):
 
 @api_router.put("/settings")
 async def update_settings(s: Settings, device: str = Depends(get_device)):
+    billing.check_local_llm(s.provider, await billing.is_pro(device))
     await db.settings.update_one({"key": device}, {"$set": s.model_dump()}, upsert=True)
     return s.model_dump()
 
@@ -328,6 +338,7 @@ def split_list(v: str) -> list:
 
 async def exec_step(step: Step, ctx: dict, settings: Settings) -> tuple[str, bool, int]:
     """Returns (output, continue_flag, steps_to_skip)."""
+    billing.check_step(step.type, step.config, bool(ctx.get("_pro")))
     c = {k: (render(v, ctx) if isinstance(v, str) else v) for k, v in step.config.items()}
     prev = str(ctx.get("prev", ""))
     t = step.type
@@ -368,6 +379,7 @@ async def exec_step(step: Step, ctx: dict, settings: Settings) -> tuple[str, boo
             raise RuntimeError(f"HTTP {r.status_code}: {r.text[:300]}")
         return r.text[:8000], True, 0
     if t == "llm":
+        await guard_llm(settings, ctx["_device"], bool(ctx.get("_pro")))
         sess = LLMSession(settings, step.config.get("system") or "You are a concise automation assistant. Reply with the result only.")
         return (await sess.complete(c.get("prompt") or prev)).strip(), True, 0
     if t == "delay":
@@ -380,6 +392,7 @@ async def exec_step(step: Step, ctx: dict, settings: Settings) -> tuple[str, boo
         ok = needle.lower() in prev.lower()
         return (prev if ok else f"Filter stopped: output does not contain '{needle}'"), ok, 0
     if t == "code":
+        await billing.consume_code(db, ctx["_device"])
         steps_out = [ctx.get(f"step_{i}", "") for i in range(1, 100) if f"step_{i}" in ctx]
         return await connectors.run_code(step.config.get("code", ""), str(ctx.get("input", "")), prev, steps_out), True, 0
     if t == "scrape":
@@ -435,13 +448,16 @@ async def exec_step(step: Step, ctx: dict, settings: Settings) -> tuple[str, boo
 
 
 async def run_workflow(wf: Workflow, trigger: str, input_text: str = "") -> Run:
+    """Raises ProRequired (HTTP 402) before anything runs if the workflow uses Pro features on a Free device."""
+    pro = await billing.is_pro(wf.device_id)
+    billing.check_workflow(wf.trigger.type, wf.steps, pro)
     settings = await get_settings(wf.device_id)
-    creds = await vault.load_creds(db, wf.device_id)
+    creds = await vault.load_creds(db, wf.device_id) if pro else {}
     run = Run(device_id=wf.device_id, workflow_id=wf.id, workflow_name=wf.name, trigger=trigger, input=input_text)
     res = await db.runs.insert_one(run.to_mongo())
     run.id = str(res.inserted_id)
     ctx: dict = {"input": input_text, "prev": input_text, "now": now_iso(), "workflow": wf.name,
-                 "_creds": creds, "_device_actions": []}
+                 "_creds": creds, "_device_actions": [], "_device": wf.device_id, "_pro": pro}
     status = "success"
     steps = wf.steps
     i = 0
@@ -517,7 +533,18 @@ async def load_wf(wf_id: str, device: Optional[str] = None) -> Workflow:
     return Workflow.from_mongo(doc)
 
 
+async def check_wf_allowed(data: WorkflowIn, device: str, creating: bool) -> None:
+    """Free plan: at most FREE_WORKFLOW_LIMIT workflows, no Pro steps/triggers/credentials."""
+    pro = await billing.is_pro(device)
+    billing.check_workflow(data.trigger.type, data.steps, pro)
+    if creating and not pro:
+        limit = billing.free_workflow_limit()
+        if await db.workflows.count_documents({"device_id": device}) >= limit:
+            raise ProRequired(f"More than {limit} workflows")
+
+
 async def create_wf(data: WorkflowIn, device: str) -> Workflow:
+    await check_wf_allowed(data, device, creating=True)
     wf = Workflow(**data.model_dump(), device_id=device, next_run_at=compute_next(data))
     res = await db.workflows.insert_one(wf.to_mongo())
     wf.id = str(res.inserted_id)
@@ -527,7 +554,10 @@ async def create_wf(data: WorkflowIn, device: str) -> Workflow:
 async def set_active(wf_id: str, active: bool, device: str) -> Workflow:
     wf = await load_wf(wf_id, device)
     wf.active = active
-    nxt = compute_next(WorkflowIn(**wf.model_dump(include={"name", "description", "active", "trigger", "steps"})))
+    data = WorkflowIn(**wf.model_dump(include={"name", "description", "active", "trigger", "steps"}))
+    if active:
+        await check_wf_allowed(data, device, creating=False)
+    nxt = compute_next(data)
     await db.workflows.update_one({"_id": ObjectId(wf_id)}, {"$set": {"active": active, "next_run_at": nxt, "updated_at": now_iso()}})
     wf.next_run_at = nxt
     return wf
@@ -558,6 +588,7 @@ async def get_workflow(wf_id: str, device: str = Depends(get_device)):
 @api_router.put("/workflows/{wf_id}")
 async def update_workflow(wf_id: str, data: WorkflowIn, device: str = Depends(get_device)):
     await load_wf(wf_id, device)
+    await check_wf_allowed(data, device, creating=False)
     upd = {**data.model_dump(), "updated_at": now_iso(), "next_run_at": compute_next(data)}
     await db.workflows.update_one({"_id": ObjectId(wf_id)}, {"$set": upd})
     return (await load_wf(wf_id, device)).out()
@@ -647,6 +678,8 @@ async def list_credentials(device: str = Depends(get_device)):
 
 @api_router.post("/credentials")
 async def create_credential(body: CredentialIn, device: str = Depends(get_device)):
+    if not await billing.is_pro(device):
+        raise ProRequired("The credentials vault")
     body = validate_cred(body)
     if await db.credentials.find_one({"device_id": device, "name": body.name}):
         raise HTTPException(400, f"A credential named '{body.name}' already exists")
@@ -765,6 +798,7 @@ async def exec_tool(name: str, args: dict, device: str) -> Any:
         merged = {**wf.model_dump(include={"name", "description", "active", "trigger", "steps"}),
                   **{k: v for k, v in args.items() if k in ("name", "description", "active", "trigger", "steps")}}
         data = WorkflowIn(**merged)
+        await check_wf_allowed(data, device, creating=False)
         await db.workflows.update_one({"_id": ObjectId(wf.id)}, {"$set": {**data.model_dump(), "updated_at": now_iso(), "next_run_at": compute_next(data)}})
         return {"id": wf.id, "name": data.name, "active": data.active, "steps": len(data.steps)}
     if name == "run_workflow":
@@ -798,9 +832,12 @@ async def exec_tool(name: str, args: dict, device: str) -> Any:
                 raise ValueError("Use a workflow for loops")
             step = Step(type=args.get("type"), config=args.get("config") or {})
         settings = await get_settings(device)
+        pro = await billing.is_pro(device)
+        billing.check_step(step.type, step.config, pro)
         inp = str(args.get("input", ""))
         ctx = {"input": inp, "prev": inp, "now": now_iso(), "workflow": "Agent",
-               "_creds": await vault.load_creds(db, device), "_device_actions": []}
+               "_creds": await vault.load_creds(db, device) if pro else {}, "_device_actions": [],
+               "_device": device, "_pro": pro}
         out, cont, _ = await exec_step(step, ctx, settings)
         return {"output": out[:4000], "continued": cont, "device_actions": ctx["_device_actions"]}
     raise ValueError(f"Unknown tool: {name}")
@@ -863,6 +900,9 @@ async def clear_messages(device: str = Depends(get_device)):
 @api_router.post("/agent/chat")
 async def agent_chat(body: ChatIn, device: str = Depends(get_device)):
     settings = await get_settings(device)
+    pro = await billing.is_pro(device)
+    billing.check_local_llm(settings.provider, pro)  # 402 before streaming starts
+    await billing.consume_agent_message(db, device, pro)  # Free: FREE_AGENT_DAILY messages/day
     prior = await db.messages.find({"device_id": device}).sort("created_at", -1).to_list(20)
     history = [{"role": d["role"], "content": d["content"]} for d in reversed(prior) if d.get("content")]
     await db.messages.insert_one(ChatMessage(device_id=device, role="user", content=body.message).to_mongo())
@@ -876,6 +916,7 @@ async def agent_chat(body: ChatIn, device: str = Depends(get_device)):
             for _ in range(6):
                 raw = ""
                 flt = ToolFilter()
+                await guard_llm(settings, device, pro)  # each agent round is one LLM call
                 async for d in session.stream(prompt):
                     raw += d
                     shown = flt.feed(d)
@@ -899,6 +940,9 @@ async def agent_chat(body: ChatIn, device: str = Depends(get_device)):
                         yield sse({"type": "tool_start", "call": tc.model_dump()})
                         tc.result = await exec_tool(tc.name, tc.args, device)
                         tc.status = "success"
+                    except ProRequired as e:
+                        tc.status, tc.result = "failed", str(e.detail)
+                        yield sse({"type": "paywall", "feature": e.feature, "text": str(e.detail)})
                     except HTTPException as e:
                         tc.status, tc.result = "failed", str(e.detail)
                     except Exception as e:
@@ -912,6 +956,9 @@ async def agent_chat(body: ChatIn, device: str = Depends(get_device)):
                     visible += "\n\n"
                     yield sse({"type": "delta", "text": "\n\n"})
                 prompt = "TOOL RESULTS:\n" + json.dumps(results, default=str, ensure_ascii=False)[:8000] + "\nContinue. Give the user a brief final answer, or call more tools if truly needed."
+        except HTTPException as e:  # daily cap reached mid-conversation
+            visible += f"\n[{e.detail}]"
+            yield sse({"type": "error", "text": str(e.detail)})
         except Exception as e:
             logger.exception("agent error")
             visible += f"\n[Agent error] {str(e)[:300]}"
@@ -928,6 +975,7 @@ async def agent_chat(body: ChatIn, device: str = Depends(get_device)):
 @api_router.post("/llm/test")
 async def llm_test(device: str = Depends(get_device)):
     settings = await get_settings(device)
+    await guard_llm(settings, device, await billing.is_pro(device))
     try:
         out = await LLMSession(settings, "Reply with exactly: OK").complete("ping")
         return {"ok": True, "reply": out.strip()[:200]}
@@ -935,7 +983,30 @@ async def llm_test(device: str = Depends(get_device)):
         return {"ok": False, "error": str(e)[:300]}
 
 
+@api_router.get("/plan")
+async def plan(device: str = Depends(get_device)):
+    """The device's plan as the server sees it, with today's usage and limits."""
+    pro = await billing.is_pro(device)
+    usage = await billing.get_usage(db, device)
+    return {"pro": pro,
+            "workflows": await db.workflows.count_documents({"device_id": device}),
+            "usage_today": {k: usage[k] for k in ("agent", "llm", "code")},
+            "limits": {"workflows": None if pro else billing.free_workflow_limit(),
+                       "agent_daily": None if pro else billing.free_agent_daily(),
+                       "llm_daily": billing.daily_llm_cap(), "code_daily": billing.daily_code_cap()}}
+
+
 # ---------------------------------------------------------------- Scheduler
+async def scheduled_run(wf: Workflow):
+    try:
+        await run_workflow(wf, "schedule")
+    except ProRequired as e:
+        logger.info("skipped scheduled workflow %s: %s", wf.id, e.detail)
+        await db.workflows.update_one({"_id": ObjectId(wf.id)}, {"$set": {"last_status": "needs_pro", "last_run_at": now_iso()}})
+    except Exception:
+        logger.exception("scheduled run failed")
+
+
 async def scheduler_loop():
     while True:
         try:
@@ -947,7 +1018,7 @@ async def scheduler_loop():
                 # bump next_run first to avoid double execution
                 nxt = (datetime.now(timezone.utc) + timedelta(minutes=max(1, wf.trigger.interval_minutes))).isoformat()
                 await db.workflows.update_one({"_id": d["_id"]}, {"$set": {"next_run_at": nxt}})
-                asyncio.create_task(run_workflow(wf, "schedule"))
+                asyncio.create_task(scheduled_run(wf))
         except Exception:
             logger.exception("scheduler error")
         await asyncio.sleep(20)
@@ -955,6 +1026,12 @@ async def scheduler_loop():
 
 @app.on_event("startup")
 async def startup():
+    try:
+        await db.usage.create_index([("device_id", 1), ("day", 1)], unique=True)
+    except Exception:
+        logger.exception("could not create usage index")
+    if not os.environ.get("REVENUECAT_SECRET_KEY"):
+        await billing.is_pro("startup-check")  # logs the 'everyone is Free' warning once
     asyncio.create_task(scheduler_loop())
 
 

@@ -12,7 +12,8 @@ This file is supposed to serve as a memory to you if you have to interact with u
   - $rc_annual  -> prod6ae66136d0   ($39.99 / P1Y, trial: P1W 7-day free trial)
 - Dashboard: https://app.revenuecat.com/projects/projcdbbe8c5
 - App user id: per-install device id from src/api.ts getDeviceId() (no auth in app), bound with Purchases.logIn in src/revenuecat.tsx
-- Gating is client-side only (src/revenuecat.tsx: FREE_WORKFLOW_LIMIT=3, FREE_AGENT_DAILY=10, PRO_STEPS; schedule & place triggers, credentials vault, local LLM are Pro)
+- Gating is enforced on the server (backend/billing.py: RevenueCat REST v1 subscriber check with REVENUECAT_SECRET_KEY, 5-min cache, fail closed) and mirrored in the app (src/revenuecat.tsx: FREE_WORKFLOW_LIMIT=3, FREE_AGENT_DAILY=10, PRO_STEPS; schedule & place triggers, credentials vault, local LLM are Pro). Server answers 402 -> app opens /paywall.
+- App ID (bundle id / package): com.taimwe.automata. The RevenueCat Apple and Play apps must use this same ID.
 
 ## Check for project_state in revenuecat status api response. if the project_state is less then project_created, re-fetch RevenueCat playbook via the integration expert tool.
 Status check:

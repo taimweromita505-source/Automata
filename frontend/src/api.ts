@@ -1,4 +1,5 @@
 import { fetch as expoFetch } from "expo/fetch";
+import { router } from "expo-router";
 
 import { storage } from "@/src/utils/storage";
 
@@ -89,6 +90,24 @@ export function getDeviceId(): Promise<string> {
   return devicePromise;
 }
 
+/** Thrown when the server answers 402: the feature needs Automata Pro. The paywall is opened automatically. */
+export class ProRequiredError extends Error {}
+
+let lastPaywallAt = 0;
+/** Opens the paywall (debounced so parallel 402s do not stack several modals). */
+export function openPaywall(feature?: string) {
+  const now = Date.now();
+  if (now - lastPaywallAt < 1500) return;
+  lastPaywallAt = now;
+  try {
+    router.push({ pathname: "/paywall", params: feature ? { feature } : {} });
+  } catch {}
+}
+
+function featureFrom(detail: string) {
+  return detail.split(" requires Automata Pro")[0] || detail;
+}
+
 export async function api<T>(path: string, opts: { method?: string; body?: any } = {}): Promise<T> {
   const res = await fetch(`${API}${path}`, {
     method: opts.method ?? "GET",
@@ -96,8 +115,16 @@ export async function api<T>(path: string, opts: { method?: string; body?: any }
     body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
   });
   const text = await res.text();
-  const data = text ? JSON.parse(text) : null;
-  if (!res.ok) throw new Error(data?.detail ? String(data.detail) : `Request failed (${res.status})`);
+  let data: any = null;
+  try {
+    data = text ? JSON.parse(text) : null;
+  } catch {}
+  const detail = data?.detail ? String(data.detail) : `Request failed (${res.status})`;
+  if (res.status === 402) {
+    openPaywall(featureFrom(detail));
+    throw new ProRequiredError(detail);
+  }
+  if (!res.ok) throw new Error(detail);
   return data as T;
 }
 
@@ -107,6 +134,7 @@ export type AgentEvent =
   | { type: "tool_result"; call: ToolCall }
   | { type: "error"; text: string }
   | { type: "device_action"; actions: DeviceAction[] }
+  | { type: "paywall"; feature: string; text: string }
   | { type: "done"; message: ChatMessage };
 
 export async function streamAgent(message: string, onEvent: (e: AgentEvent) => void) {
@@ -115,7 +143,18 @@ export async function streamAgent(message: string, onEvent: (e: AgentEvent) => v
     headers: { "Content-Type": "application/json", Accept: "text/event-stream", "X-Device-Id": await getDeviceId() },
     body: JSON.stringify({ message }),
   });
-  if (!res.ok || !res.body) throw new Error(`Agent request failed (${res.status})`);
+  if (!res.ok || !res.body) {
+    let detail = `Agent request failed (${res.status})`;
+    try {
+      const data = await res.json();
+      if (data?.detail) detail = String(data.detail);
+    } catch {}
+    if (res.status === 402) {
+      openPaywall(featureFrom(detail));
+      throw new ProRequiredError(detail);
+    }
+    throw new Error(detail);
+  }
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
   let buf = "";
@@ -129,7 +168,9 @@ export async function streamAgent(message: string, onEvent: (e: AgentEvent) => v
       buf = buf.slice(idx + 2);
       if (chunk.startsWith("data:")) {
         try {
-          onEvent(JSON.parse(chunk.slice(5).trim()));
+          const ev = JSON.parse(chunk.slice(5).trim()) as AgentEvent;
+          if (ev.type === "paywall") openPaywall(ev.feature); // an agent tool needed Pro
+          onEvent(ev);
         } catch {}
       }
     }

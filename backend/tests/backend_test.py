@@ -1,12 +1,26 @@
 """Backend tests for Automata (iteration 2: X-Device-Id, credentials vault, new step types, agent tools)."""
+# End-to-end tests against a running backend (default http://localhost:8001; set EXPO_PUBLIC_BACKEND_URL).
+# Skipped automatically when no backend is reachable. Run the server with a RevenueCat key (or a mock)
+# that grants Pro, otherwise the Pro-only cases correctly return 402.
 import json
 import os
 import uuid
 import requests
 import pytest
 
-BASE_URL = os.environ.get("EXPO_PUBLIC_BACKEND_URL", "https://pocket-automation.preview.emergentagent.com").rstrip("/")
+BASE_URL = os.environ.get("EXPO_PUBLIC_BACKEND_URL", "http://localhost:8001").rstrip("/")
 API = f"{BASE_URL}/api"
+
+
+def _backend_up() -> bool:
+    try:
+        requests.get(f"{API}/", timeout=3)
+        return True
+    except requests.RequestException:
+        return False
+
+
+pytestmark = pytest.mark.skipif(not _backend_up(), reason=f"no backend running at {BASE_URL}")
 
 DEVICE_A = "test-device-" + uuid.uuid4().hex[:10]
 DEVICE_B = "test-device-" + uuid.uuid4().hex[:10]
