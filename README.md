@@ -32,6 +32,10 @@ The app identifies each install with a random device ID (`X-Device-Id` header), 
 - Backend: FastAPI, MongoDB (motor), httpx. LLM calls go through `emergentintegrations` (Emergent universal key) or a local OpenAI-compatible endpoint.
 - Tests: pytest (`backend/tests`)
 
+## Hosting (Emergent)
+
+Automata is built and hosted on [Emergent](https://emergent.sh). Keep `.emergent/`, `test_result.md` and `test_reports/`: Emergent's build and testing agents use them. Set the backend env vars (including `REVENUECAT_SECRET_KEY`) in the Emergent deployment, then redeploy from Emergent.
+
 ## Run locally
 
 ```bash
