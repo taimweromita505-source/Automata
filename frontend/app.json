@@ -9,7 +9,7 @@
     "userInterfaceStyle": "dark",
     "ios": {
       "supportsTablet": true,
-      "bundleIdentifier": "com.emergent.pocketautomation.frimg9",
+      "bundleIdentifier": "com.taimwe.automata",
       "infoPlist": {
         "NSLocationWhenInUseUsageDescription": "Pick places that trigger your automations",
         "NSLocationAlwaysAndWhenInUseUsageDescription": "Run automations when you arrive or leave places",
@@ -24,7 +24,7 @@
         "foregroundImage": "./assets/images/adaptive-icon.png",
         "backgroundColor": "#0D0D0D"
       },
-      "package": "com.emergent.pocketautomation.frimg9",
+      "package": "com.taimwe.automata",
       "permissions": [
         "ACCESS_COARSE_LOCATION",
         "ACCESS_FINE_LOCATION",

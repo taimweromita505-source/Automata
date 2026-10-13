@@ -16,7 +16,7 @@ Build a mobile app with built-in n8n and an agent powered by local LLM or API pr
 - Dark tactical design (Rajdhani / IBM Plex fonts, amber #FF6B00 accent, Phosphor icons)
 
 ## Implemented (2026-06)
-- Iteration 3 (paid app): free download + Automata Pro subscription via Emergent-managed RevenueCat (monthly + yearly, `pro` entitlement). Coded paywall with restore, simulated Test Store purchase in preview, identity bound to device id. Client-side gates: 3 workflows and 10 agent messages/day on free; Pro unlocks schedules, place triggers, code/messaging/Google steps, credentials vault and local LLM. Details in /app/memory/revenuecat.md
+- Iteration 3 (paid app): free download + Automata Pro subscription via Emergent-managed RevenueCat (monthly + yearly, `pro` entitlement). Coded paywall with restore, simulated Test Store purchase in preview, identity bound to device id. Gates (enforced server-side since the safe-to-sell update, mirrored in the app): 3 workflows and 10 agent messages/day on free; Pro unlocks schedules, place triggers, code/messaging/Google steps, credentials vault and local LLM. Details in /app/memory/revenuecat.md
 - Iteration 2 ("automate anything"):
   - Every install gets its own device ID (X-Device-Id header), so each user has separate workflows, runs, chats, settings and credentials
   - Encrypted credentials vault (Fernet) where users add their own keys: Telegram, Slack, Discord, Resend, Google OAuth (client + refresh token), Bearer, API-key header, Basic, Custom
