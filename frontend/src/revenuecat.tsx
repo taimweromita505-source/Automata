@@ -5,14 +5,16 @@ import { Platform } from "react-native";
 import Purchases, { LOG_LEVEL } from "react-native-purchases";
 import type { CustomerInfo, PurchasesPackage } from "react-native-purchases";
 
-import { getDeviceId } from "@/src/api";
+import { api, getDeviceId, Plan } from "@/src/api";
 
 const REVENUECAT_TEST_API_KEY = process.env.EXPO_PUBLIC_REVENUECAT_TEST_API_KEY;
 const REVENUECAT_IOS_API_KEY = process.env.EXPO_PUBLIC_REVENUECAT_IOS_API_KEY;
 const REVENUECAT_ANDROID_API_KEY = process.env.EXPO_PUBLIC_REVENUECAT_ANDROID_API_KEY;
 
 export const REVENUECAT_ENTITLEMENT_IDENTIFIER = "pro";
-export const rcEnabled = Platform.OS !== "web" || __DEV__; // web preview uses the Test Store
+/** RevenueCat is optional: a self-hosted backend may not sell subscriptions at all. */
+export const rcConfigured = !!(REVENUECAT_TEST_API_KEY && REVENUECAT_IOS_API_KEY && REVENUECAT_ANDROID_API_KEY);
+export const rcEnabled = rcConfigured && (Platform.OS !== "web" || __DEV__); // web preview uses the Test Store
 export const isTestStore = Platform.OS === "web" || __DEV__;
 
 // Free tier limits (Pro removes them)
@@ -21,8 +23,8 @@ export const FREE_AGENT_DAILY = 10;
 export const PRO_STEPS = ["code", "telegram", "slack", "discord", "email", "sheets", "gmail", "drive", "calendar"];
 
 function getRevenueCatApiKey() {
-  if (!REVENUECAT_TEST_API_KEY || !REVENUECAT_IOS_API_KEY || !REVENUECAT_ANDROID_API_KEY) {
-    throw new Error("RevenueCat public API keys not found");
+  if (!rcConfigured) {
+    throw new Error("RevenueCat public API keys not set");
   }
   if (isTestStore) return REVENUECAT_TEST_API_KEY;
   if (Platform.OS === "ios") return REVENUECAT_IOS_API_KEY;
@@ -58,6 +60,14 @@ function useSubscriptionContext() {
     })();
   }, [queryClient]);
 
+  // The backend is the source of truth for entitlements: a self-hosted server
+  // running with BILLING_MODE=open reports pro: true for every install.
+  const planQuery = useQuery({
+    queryKey: ["plan"],
+    queryFn: () => api<Plan>("/plan"),
+    staleTime: 60 * 1000,
+  });
+
   const customerInfoQuery = useQuery({
     queryKey: ["revenuecat", "customer-info"],
     queryFn: () => Purchases.getCustomerInfo(),
@@ -92,12 +102,14 @@ function useSubscriptionContext() {
 
   const restoreMutation = useMutation({ mutationFn: () => Purchases.restorePurchases() });
 
-  const isSubscribed =
+  const serverPro = planQuery.data?.pro === true;
+  const isSubscribed = serverPro ||
     customerInfoQuery.data?.entitlements.active?.[REVENUECAT_ENTITLEMENT_IDENTIFIER] !== undefined;
   const originalAppUserId = customerInfoQuery.data?.originalAppUserId;
   const identityReady = !!originalAppUserId && !originalAppUserId.startsWith("$RCAnonymousID:");
 
   return {
+    plan: planQuery.data,
     customerInfo: customerInfoQuery.data,
     offerings: offeringsQuery.data,
     offeringsError: offeringsQuery.error,

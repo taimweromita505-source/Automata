@@ -1,7 +1,18 @@
-"""Server-side plan enforcement: RevenueCat 'pro' entitlement check, free-tier limits, daily cost caps.
+"""Plan enforcement and daily cost caps.
 
-The app's paywall is only a convenience; this module is what actually protects paid features and
-the server's LLM / code-execution budget. Every limit here mirrors frontend/src/revenuecat.tsx.
+Two modes, selected with BILLING_MODE:
+
+    open        (default) Self-hosted: every feature unlocked, no RevenueCat
+                account needed. The daily caps below still apply, because they
+                protect YOUR llm API budget, not a subscription.
+    revenuecat  Paid app: the server asks RevenueCat whether the install has an
+                active 'pro' entitlement. Fails closed — without
+                REVENUECAT_SECRET_KEY, or if RevenueCat cannot be reached, the
+                device is treated as Free.
+
+Free-tier limits mirror frontend/src/revenuecat.tsx. The app's paywall is a
+convenience; this module is what actually protects paid features and the
+server's LLM / code-execution budget.
 """
 import logging
 import os
@@ -12,8 +23,6 @@ from urllib.parse import quote
 
 import httpx
 from fastapi import HTTPException
-from pymongo import ReturnDocument
-from pymongo.errors import DuplicateKeyError
 
 logger = logging.getLogger("billing")
 
@@ -27,6 +36,15 @@ def _int_env(name: str, default: int) -> int:
         return int(os.environ.get(name, default))
     except (TypeError, ValueError):
         return default
+
+
+def mode() -> str:
+    return (os.environ.get("BILLING_MODE") or "open").strip().lower()
+
+
+def paid_mode() -> bool:
+    """True when subscriptions are actually being sold and enforced."""
+    return mode() in ("revenuecat", "paid", "on")
 
 
 def free_workflow_limit() -> int:
@@ -95,16 +113,21 @@ def entitlement_active(subscriber: dict, now: Optional[datetime] = None) -> bool
 
 
 async def is_pro(device_id: str) -> bool:
-    """True when this install's RevenueCat app user id has an active 'pro' entitlement.
+    """True when this install may use Pro features.
 
-    Fails closed: without REVENUECAT_SECRET_KEY, or when RevenueCat cannot be reached, the device is free.
-    Results are cached for PRO_CACHE_SECONDS (default 5 minutes); errors only for 30 seconds.
+    In 'open' mode (the self-hosted default) that is always true. In
+    'revenuecat' mode it is true only while the device's app user id has an
+    active 'pro' entitlement; lookups are cached for PRO_CACHE_SECONDS, errors
+    for 30 seconds.
     """
     global _warned_missing_key
+    if not paid_mode():
+        return True
     key = os.environ.get("REVENUECAT_SECRET_KEY", "").strip()
     if not key:
         if not _warned_missing_key:
-            logger.warning("REVENUECAT_SECRET_KEY is not set: every device is treated as Free (Pro features are blocked).")
+            logger.warning("BILLING_MODE=revenuecat but REVENUECAT_SECRET_KEY is not set: "
+                           "every device is treated as Free.")
             _warned_missing_key = True
         return False
     hit = _cache.get(device_id)
@@ -164,43 +187,37 @@ def check_local_llm(provider: str, pro: bool) -> None:
         raise ProRequired("Local LLM")
 
 
-# ---------------------------------------------------------------- Daily counters (MongoDB)
+# ---------------------------------------------------------------- Daily counters
 def today() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
 
-async def get_usage(db, device_id: str) -> dict:
-    doc = await db.usage.find_one({"device_id": device_id, "day": today()}, {"_id": 0})
-    return {"agent": 0, "llm": 0, "code": 0, **(doc or {})}
+async def get_usage(store, device_id: str) -> dict:
+    return await store.usage(device_id, today())
 
 
-async def consume(db, device_id: str, kind: str, limit: int, error: HTTPException) -> int:
-    """Atomically add one to today's counter; if that exceeds `limit`, roll back and raise `error`."""
-    q = {"device_id": device_id, "day": today()}
-    try:
-        doc = await db.usage.find_one_and_update(q, {"$inc": {kind: 1}}, upsert=True, return_document=ReturnDocument.AFTER)
-    except DuplicateKeyError:  # two first-of-the-day upserts raced; the document exists now
-        doc = await db.usage.find_one_and_update(q, {"$inc": {kind: 1}}, return_document=ReturnDocument.AFTER)
-    n = int((doc or {}).get(kind, 0))
+async def consume(store, device_id: str, kind: str, limit: int, error: HTTPException) -> int:
+    """Add one to today's counter; if that exceeds `limit`, roll back and raise `error`."""
+    n = await store.usage_inc(device_id, today(), kind)
     if n > limit:
-        await db.usage.update_one(q, {"$inc": {kind: -1}})
+        await store.usage_dec(device_id, today(), kind)
         raise error
     return n
 
 
-async def consume_agent_message(db, device_id: str, pro: bool) -> None:
+async def consume_agent_message(store, device_id: str, pro: bool) -> None:
     if pro:
         return
     limit = free_agent_daily()
-    await consume(db, device_id, "agent", limit,
+    await consume(store, device_id, "agent", limit,
                   ProRequired(f"More than {limit} agent messages a day"))
 
 
-async def consume_llm(db, device_id: str) -> None:
+async def consume_llm(store, device_id: str) -> None:
     cap = daily_llm_cap()
-    await consume(db, device_id, "llm", cap, DailyCapReached("AI calls", cap))
+    await consume(store, device_id, "llm", cap, DailyCapReached("AI calls", cap))
 
 
-async def consume_code(db, device_id: str) -> None:
+async def consume_code(store, device_id: str) -> None:
     cap = daily_code_cap()
-    await consume(db, device_id, "code", cap, DailyCapReached("code runs", cap))
+    await consume(store, device_id, "code", cap, DailyCapReached("code runs", cap))

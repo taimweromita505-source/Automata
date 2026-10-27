@@ -1,9 +1,16 @@
+"""Automata API.
+
+FastAPI backend for the Automata app: workflow engine, scheduler, webhook
+triggers, SSE agent and the encrypted credentials vault.
+
+Self-contained by design: SQLite for storage (db.py), plain HTTP for LLM calls
+(llm.py). No vendor SDKs and no external services are needed to run it.
+"""
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, APIRouter, HTTPException, Request, Depends, Header
 from fastapi.responses import StreamingResponse
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
-from motor.motor_asyncio import AsyncIOMotorClient
-from bson import ObjectId
 import os
 import re
 import json
@@ -12,53 +19,57 @@ import time
 import asyncio
 import logging
 from pathlib import Path
-from pydantic import BaseModel, Field, BeforeValidator, ConfigDict
-from typing import List, Optional, Any, Annotated, Literal, AsyncIterator
+from pydantic import BaseModel, Field
+from typing import List, Optional, Any, Literal, AsyncIterator
 from datetime import datetime, timezone, timedelta
 import httpx
-from emergentintegrations.llm.chat import LlmChat, UserMessage, TextDelta, StreamDone
+
 import billing
 import connectors
+import llm
 import vault
 from billing import ProRequired
+from db import Store, new_id, now_iso
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
 
-mongo_url = os.environ['MONGO_URL']
-client = AsyncIOMotorClient(mongo_url)
-db = client[os.environ['DB_NAME']]
-EMERGENT_LLM_KEY = os.environ.get('EMERGENT_LLM_KEY', '')
+DATA_DIR = os.environ.get("DATA_DIR", str(ROOT_DIR / "data"))
+store = Store(os.environ.get("DB_PATH", os.path.join(DATA_DIR, "automata.db")))
 
-app = FastAPI()
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    await store.connect()
+    logger.info("storage ready at %s (billing mode: %s)", store.path, billing.mode())
+    if billing.paid_mode() and not os.environ.get("REVENUECAT_SECRET_KEY"):
+        await billing.is_pro("startup-check")  # logs the 'everyone is Free' warning once
+    scheduler = asyncio.create_task(scheduler_loop())
+    try:
+        yield
+    finally:
+        scheduler.cancel()
+        await store.close()
+
+
+app = FastAPI(title="Automata API", lifespan=lifespan)
 api_router = APIRouter(prefix="/api")
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 
-def now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
 # ---------------------------------------------------------------- Models
-PyObjectId = Annotated[str, BeforeValidator(lambda v: str(v) if isinstance(v, ObjectId) else v)]
-
-
 class BaseDocument(BaseModel):
-    model_config = ConfigDict(populate_by_name=True)
-    id: Optional[PyObjectId] = Field(default=None, alias="_id")
+    id: Optional[str] = None
 
     @classmethod
-    def from_mongo(cls, doc: dict):
+    def from_doc(cls, doc: dict):
         return cls.model_validate(doc)
 
-    def to_mongo(self) -> dict:
-        data = self.model_dump(by_alias=True, exclude={"id"})
-        data.pop("_id", None)
-        return data
+    def to_doc(self) -> dict:
+        return self.model_dump()
 
     def out(self) -> dict:
-        return self.model_dump(by_alias=False)
+        return self.model_dump()
 
 
 StepType = Literal["http", "llm", "delay", "set", "filter", "code", "scrape", "search", "if", "loop",
@@ -129,9 +140,10 @@ class Run(BaseDocument):
 
 
 class Settings(BaseModel):
+    # "emergent" is the legacy wire name for "cloud provider using the server's key".
     provider: Literal["emergent", "local"] = "emergent"
     emergent_provider: Literal["openai", "anthropic", "gemini"] = "openai"
-    emergent_model: str = "gpt-5.4"
+    emergent_model: str = ""
     local_base_url: str = ""
     local_model: str = ""
     local_api_key: str = ""
@@ -182,15 +194,21 @@ async def get_device(x_device_id: Optional[str] = Header(None)) -> str:
 
 # ---------------------------------------------------------------- Settings
 async def get_settings(device: str) -> Settings:
-    doc = await db.settings.find_one({"key": device}, {"_id": 0, "key": 0})
-    return Settings(**(doc or {}))
+    doc = await store.get("settings", device, device)
+    if not doc:
+        return Settings(emergent_model=llm.default_model("openai"))
+    doc = {k: v for k, v in doc.items() if k not in ("id", "device_id")}
+    s = Settings(**doc)
+    if not s.emergent_model:
+        s.emergent_model = llm.default_model(s.emergent_provider)
+    return s
 
 
 async def guard_llm(settings: Settings, device: str, pro: bool) -> None:
     """Call before every LLM request: Local LLM is Pro-only; server-paid calls count toward the daily cap."""
     billing.check_local_llm(settings.provider, pro)
     if settings.provider == "emergent":
-        await billing.consume_llm(db, device)
+        await billing.consume_llm(store, device)
 
 
 @api_router.get("/settings")
@@ -201,61 +219,37 @@ async def read_settings(device: str = Depends(get_device)):
 @api_router.put("/settings")
 async def update_settings(s: Settings, device: str = Depends(get_device)):
     billing.check_local_llm(s.provider, await billing.is_pro(device))
-    await db.settings.update_one({"key": device}, {"$set": s.model_dump()}, upsert=True)
+    if not s.emergent_model:
+        s.emergent_model = llm.default_model(s.emergent_provider)
+    await store.insert("settings", {"id": device, "device_id": device, **s.model_dump()})
     return s.model_dump()
 
 
 # ---------------------------------------------------------------- LLM layer
 class LLMSession:
-    """Multi-turn session over Emergent universal key or a local OpenAI-compatible endpoint."""
+    """Multi-turn session over the server's provider key or a local OpenAI-compatible endpoint.
+
+    The system prompt and the prior conversation are resend on every turn, so
+    the session holds no provider-side state and works with any backend.
+    """
 
     def __init__(self, settings: Settings, system: str, history: Optional[List[dict]] = None):
         self.s = settings
         self.system = system
-        self.messages: List[dict] = [{"role": "system", "content": system}] + (history or [])
-        if settings.provider == "emergent":
-            sys_full = system
-            if history:
-                transcript = "\n".join(f"{m['role'].upper()}: {m['content']}" for m in history)
-                sys_full += f"\n\n# Conversation so far\n{transcript}"
-            self.chat = LlmChat(api_key=EMERGENT_LLM_KEY, session_id=uuid.uuid4().hex,
-                                system_message=sys_full).with_model(settings.emergent_provider, settings.emergent_model)
+        self.messages: List[dict] = list(history or [])
 
     async def stream(self, text: str) -> AsyncIterator[str]:
+        turns = self.messages + [{"role": "user", "content": text}]
         if self.s.provider == "emergent":
-            async for ev in self.chat.stream_message(UserMessage(text=text)):
-                if isinstance(ev, TextDelta):
-                    yield ev.content
-                elif isinstance(ev, StreamDone):
-                    break
-            return
-        if not self.s.local_base_url or not self.s.local_model:
-            raise RuntimeError("Local LLM is not configured. Set base URL and model in Settings.")
-        self.messages.append({"role": "user", "content": text})
-        url = self.s.local_base_url.rstrip("/") + "/chat/completions"
-        headers = {"Content-Type": "application/json"}
-        if self.s.local_api_key:
-            headers["Authorization"] = f"Bearer {self.s.local_api_key}"
+            gen = llm.stream(self.system, turns, self.s.emergent_provider, self.s.emergent_model)
+        else:
+            gen = llm.stream_local(self.s.local_base_url, self.s.local_model, self.s.local_api_key,
+                                   self.system, turns)
         full = ""
-        async with httpx.AsyncClient(timeout=httpx.Timeout(180, connect=15)) as hc:
-            async with hc.stream("POST", url, headers=headers, json={
-                "model": self.s.local_model, "messages": self.messages, "stream": True}) as r:
-                if r.status_code >= 400:
-                    body = (await r.aread()).decode(errors="ignore")[:300]
-                    raise RuntimeError(f"Local LLM error {r.status_code}: {body}")
-                async for line in r.aiter_lines():
-                    if not line.startswith("data:"):
-                        continue
-                    data = line[5:].strip()
-                    if data == "[DONE]":
-                        break
-                    try:
-                        delta = json.loads(data)["choices"][0].get("delta", {}).get("content") or ""
-                    except Exception:
-                        delta = ""
-                    if delta:
-                        full += delta
-                        yield delta
+        async for delta in gen:
+            full += delta
+            yield delta
+        self.messages.append({"role": "user", "content": text})
         self.messages.append({"role": "assistant", "content": full})
 
     async def complete(self, text: str) -> str:
@@ -392,7 +386,7 @@ async def exec_step(step: Step, ctx: dict, settings: Settings) -> tuple[str, boo
         ok = needle.lower() in prev.lower()
         return (prev if ok else f"Filter stopped: output does not contain '{needle}'"), ok, 0
     if t == "code":
-        await billing.consume_code(db, ctx["_device"])
+        await billing.consume_code(store, ctx["_device"])
         steps_out = [ctx.get(f"step_{i}", "") for i in range(1, 100) if f"step_{i}" in ctx]
         return await connectors.run_code(step.config.get("code", ""), str(ctx.get("input", "")), prev, steps_out), True, 0
     if t == "scrape":
@@ -406,7 +400,7 @@ async def exec_step(step: Step, ctx: dict, settings: Settings) -> tuple[str, boo
             return prev, True, 0
         if c.get("on_false", "stop") == "skip":
             return prev, True, max(1, int(step.config.get("skip_count", 1) or 1))
-        return f"Condition false: workflow stopped", False, 0
+        return "Condition false: workflow stopped", False, 0
     if t == "telegram":
         d = get_cred(ctx, c.get("credential", ""), ("telegram",))
         return await connectors.telegram(d.get("bot_token", ""), c.get("chat_id") or d.get("chat_id", ""), c.get("text") or prev), True, 0
@@ -452,10 +446,10 @@ async def run_workflow(wf: Workflow, trigger: str, input_text: str = "") -> Run:
     pro = await billing.is_pro(wf.device_id)
     billing.check_workflow(wf.trigger.type, wf.steps, pro)
     settings = await get_settings(wf.device_id)
-    creds = await vault.load_creds(db, wf.device_id) if pro else {}
+    creds = await vault.load_creds(store, wf.device_id) if pro else {}
     run = Run(device_id=wf.device_id, workflow_id=wf.id, workflow_name=wf.name, trigger=trigger, input=input_text)
-    res = await db.runs.insert_one(run.to_mongo())
-    run.id = str(res.inserted_id)
+    saved = await store.insert("runs", run.to_doc())
+    run.id = saved["id"]
     ctx: dict = {"input": input_text, "prev": input_text, "now": now_iso(), "workflow": wf.name,
                  "_creds": creds, "_device_actions": [], "_device": wf.device_id, "_pro": pro}
     status = "success"
@@ -507,11 +501,11 @@ async def run_workflow(wf: Workflow, trigger: str, input_text: str = "") -> Run:
     run.device_actions = ctx["_device_actions"]
     run.device_delivered = not run.device_actions or trigger not in ("schedule", "webhook")
     run.finished_at = now_iso()
-    await db.runs.update_one({"_id": ObjectId(run.id)}, {"$set": run.to_mongo()})
+    await store.replace("runs", run.to_doc())
     upd = {"last_run_at": run.finished_at, "last_status": status}
     if wf.trigger.type == "schedule" and wf.active:
         upd["next_run_at"] = (datetime.now(timezone.utc) + timedelta(minutes=max(1, wf.trigger.interval_minutes))).isoformat()
-    await db.workflows.update_one({"_id": ObjectId(wf.id)}, {"$set": upd})
+    await store.update("workflows", wf.id, upd)
     return run
 
 
@@ -522,15 +516,12 @@ def compute_next(wf_in: WorkflowIn) -> Optional[str]:
 
 
 async def load_wf(wf_id: str, device: Optional[str] = None) -> Workflow:
-    if not ObjectId.is_valid(wf_id):
+    if not wf_id:
         raise HTTPException(404, "Workflow not found")
-    q: dict = {"_id": ObjectId(wf_id)}
-    if device is not None:
-        q["device_id"] = device
-    doc = await db.workflows.find_one(q)
+    doc = await store.get("workflows", wf_id, device)
     if not doc:
         raise HTTPException(404, "Workflow not found")
-    return Workflow.from_mongo(doc)
+    return Workflow.from_doc(doc)
 
 
 async def check_wf_allowed(data: WorkflowIn, device: str, creating: bool) -> None:
@@ -539,15 +530,15 @@ async def check_wf_allowed(data: WorkflowIn, device: str, creating: bool) -> Non
     billing.check_workflow(data.trigger.type, data.steps, pro)
     if creating and not pro:
         limit = billing.free_workflow_limit()
-        if await db.workflows.count_documents({"device_id": device}) >= limit:
+        if await store.count("workflows", device) >= limit:
             raise ProRequired(f"More than {limit} workflows")
 
 
 async def create_wf(data: WorkflowIn, device: str) -> Workflow:
     await check_wf_allowed(data, device, creating=True)
     wf = Workflow(**data.model_dump(), device_id=device, next_run_at=compute_next(data))
-    res = await db.workflows.insert_one(wf.to_mongo())
-    wf.id = str(res.inserted_id)
+    saved = await store.insert("workflows", wf.to_doc())
+    wf.id = saved["id"]
     return wf
 
 
@@ -558,7 +549,7 @@ async def set_active(wf_id: str, active: bool, device: str) -> Workflow:
     if active:
         await check_wf_allowed(data, device, creating=False)
     nxt = compute_next(data)
-    await db.workflows.update_one({"_id": ObjectId(wf_id)}, {"$set": {"active": active, "next_run_at": nxt, "updated_at": now_iso()}})
+    await store.update("workflows", wf_id, {"active": active, "next_run_at": nxt, "updated_at": now_iso()})
     wf.next_run_at = nxt
     return wf
 
@@ -566,13 +557,13 @@ async def set_active(wf_id: str, active: bool, device: str) -> Workflow:
 # ---------------------------------------------------------------- Workflow routes
 @api_router.get("/")
 async def root():
-    return {"message": "Automata API"}
+    return {"message": "Automata API", "billing_mode": billing.mode()}
 
 
 @api_router.get("/workflows")
 async def list_workflows(device: str = Depends(get_device)):
-    docs = await db.workflows.find({"device_id": device}).sort("updated_at", -1).to_list(500)
-    return [Workflow.from_mongo(d).out() for d in docs]
+    docs = await store.find("workflows", device, limit=500)
+    return [Workflow.from_doc(d).out() for d in docs]
 
 
 @api_router.post("/workflows")
@@ -590,14 +581,14 @@ async def update_workflow(wf_id: str, data: WorkflowIn, device: str = Depends(ge
     await load_wf(wf_id, device)
     await check_wf_allowed(data, device, creating=False)
     upd = {**data.model_dump(), "updated_at": now_iso(), "next_run_at": compute_next(data)}
-    await db.workflows.update_one({"_id": ObjectId(wf_id)}, {"$set": upd})
+    await store.update("workflows", wf_id, upd)
     return (await load_wf(wf_id, device)).out()
 
 
 @api_router.delete("/workflows/{wf_id}")
 async def delete_workflow(wf_id: str, device: str = Depends(get_device)):
     await load_wf(wf_id, device)
-    await db.workflows.delete_one({"_id": ObjectId(wf_id)})
+    await store.delete("workflows", wf_id, device)
     return {"ok": True}
 
 
@@ -623,26 +614,22 @@ async def webhook_trigger(wf_id: str, request: Request):
 
 @api_router.get("/runs")
 async def list_runs(workflow_id: Optional[str] = None, limit: int = 50, device: str = Depends(get_device)):
-    q: dict = {"device_id": device}
+    docs = await store.find("runs", device, limit=min(limit, 200), order_by="started_at")
     if workflow_id:
-        q["workflow_id"] = workflow_id
-    docs = await db.runs.find(q).sort("started_at", -1).to_list(min(limit, 200))
-    return [Run.from_mongo(d).out() for d in docs]
+        docs = [d for d in docs if d.get("workflow_id") == workflow_id]
+    return [Run.from_doc(d).out() for d in docs]
 
 
 @api_router.delete("/runs")
 async def clear_runs(device: str = Depends(get_device)):
-    await db.runs.delete_many({"device_id": device})
+    await store.delete_many("runs", device)
     return {"ok": True}
 
 
 @api_router.get("/device/pending")
 async def device_pending(device: str = Depends(get_device)):
     """Phone actions produced by background (schedule/webhook) runs, delivered once."""
-    docs = await db.runs.find({"device_id": device, "device_delivered": False}).sort("started_at", 1).to_list(50)
-    if docs:
-        await db.runs.update_many({"_id": {"$in": [d["_id"] for d in docs]}}, {"$set": {"device_delivered": True}})
-    return [a for d in docs for a in d.get("device_actions", [])]
+    return await store.take_pending_actions(device)
 
 
 # ---------------------------------------------------------------- Credentials vault
@@ -651,7 +638,7 @@ def cred_out(d: dict) -> dict:
         data = vault.decrypt(d["data_enc"])
     except Exception:
         data = {}
-    return {"id": str(d["_id"]), "name": d["name"], "type": d["type"], "created_at": d.get("created_at"),
+    return {"id": d["id"], "name": d["name"], "type": d["type"], "created_at": d.get("created_at"),
             "fields": {k: vault.mask(v) for k, v in data.items()}}
 
 
@@ -672,7 +659,7 @@ def validate_cred(body: CredentialIn) -> CredentialIn:
 
 @api_router.get("/credentials")
 async def list_credentials(device: str = Depends(get_device)):
-    docs = await db.credentials.find({"device_id": device}).sort("created_at", -1).to_list(200)
+    docs = await store.find("credentials", device, limit=200, order_by="created_at")
     return [cred_out(d) for d in docs]
 
 
@@ -681,20 +668,17 @@ async def create_credential(body: CredentialIn, device: str = Depends(get_device
     if not await billing.is_pro(device):
         raise ProRequired("The credentials vault")
     body = validate_cred(body)
-    if await db.credentials.find_one({"device_id": device, "name": body.name}):
+    if await store.find_by_name("credentials", device, body.name):
         raise HTTPException(400, f"A credential named '{body.name}' already exists")
-    doc = {"device_id": device, "name": body.name, "type": body.type, "data_enc": vault.encrypt(body.data), "created_at": now_iso()}
-    res = await db.credentials.insert_one(doc)
-    doc["_id"] = res.inserted_id
-    return cred_out(doc)
+    doc = {"device_id": device, "name": body.name, "type": body.type,
+           "data_enc": vault.encrypt(body.data), "created_at": now_iso()}
+    saved = await store.insert("credentials", doc)
+    return cred_out(saved)
 
 
 @api_router.delete("/credentials/{cred_id}")
 async def delete_credential(cred_id: str, device: str = Depends(get_device)):
-    if not ObjectId.is_valid(cred_id):
-        raise HTTPException(404, "Credential not found")
-    r = await db.credentials.delete_one({"_id": ObjectId(cred_id), "device_id": device})
-    if not r.deleted_count:
+    if not await store.delete("credentials", cred_id, device):
         raise HTTPException(404, "Credential not found")
     return {"ok": True}
 
@@ -787,8 +771,8 @@ TOOL_RE = re.compile(r"<tool>(.*?)</tool>", re.S)
 
 async def exec_tool(name: str, args: dict, device: str) -> Any:
     if name == "list_workflows":
-        docs = await db.workflows.find({"device_id": device}).to_list(200)
-        return [{"id": str(d["_id"]), "name": d["name"], "active": d.get("active"),
+        docs = await store.find("workflows", device, limit=200)
+        return [{"id": d["id"], "name": d["name"], "active": d.get("active"),
                  "trigger": d.get("trigger"), "steps": [s.get("type") for s in d.get("steps", [])]} for d in docs]
     if name == "create_workflow":
         wf = await create_wf(WorkflowIn(**args), device)
@@ -799,7 +783,7 @@ async def exec_tool(name: str, args: dict, device: str) -> Any:
                   **{k: v for k, v in args.items() if k in ("name", "description", "active", "trigger", "steps")}}
         data = WorkflowIn(**merged)
         await check_wf_allowed(data, device, creating=False)
-        await db.workflows.update_one({"_id": ObjectId(wf.id)}, {"$set": {**data.model_dump(), "updated_at": now_iso(), "next_run_at": compute_next(data)}})
+        await store.update("workflows", wf.id, {**data.model_dump(), "updated_at": now_iso(), "next_run_at": compute_next(data)})
         return {"id": wf.id, "name": data.name, "active": data.active, "steps": len(data.steps)}
     if name == "run_workflow":
         wf = await load_wf(str(args.get("workflow_id", "")), device)
@@ -810,13 +794,13 @@ async def exec_tool(name: str, args: dict, device: str) -> Any:
         wf = await set_active(str(args.get("workflow_id", "")), bool(args.get("active")), device)
         return {"id": wf.id, "active": wf.active, "next_run_at": wf.next_run_at}
     if name == "list_runs":
-        docs = await db.runs.find({"device_id": device}).sort("started_at", -1).to_list(int(args.get("limit", 10)))
+        docs = await store.find("runs", device, limit=int(args.get("limit", 10)), order_by="started_at")
         return [{"workflow": d["workflow_name"], "status": d["status"], "at": d["started_at"],
                  "output": (d.get("output") or "")[:300]} for d in docs]
     if name == "n8n_list_workflows":
         return await n8n_list(device)
     if name == "list_credentials":
-        docs = await db.credentials.find({"device_id": device}).to_list(200)
+        docs = await store.find("credentials", device, limit=200, order_by="created_at")
         return [{"name": d["name"], "type": d["type"]} for d in docs]
     if name == "web_search":
         return await connectors.web_search(str(args.get("query", "")))
@@ -836,7 +820,7 @@ async def exec_tool(name: str, args: dict, device: str) -> Any:
         billing.check_step(step.type, step.config, pro)
         inp = str(args.get("input", ""))
         ctx = {"input": inp, "prev": inp, "now": now_iso(), "workflow": "Agent",
-               "_creds": await vault.load_creds(db, device) if pro else {}, "_device_actions": [],
+               "_creds": await vault.load_creds(store, device) if pro else {}, "_device_actions": [],
                "_device": device, "_pro": pro}
         out, cont, _ = await exec_step(step, ctx, settings)
         return {"output": out[:4000], "continued": cont, "device_actions": ctx["_device_actions"]}
@@ -845,6 +829,7 @@ async def exec_tool(name: str, args: dict, device: str) -> Any:
 
 class ToolFilter:
     """Streams visible text while hiding <tool>...</tool> blocks."""
+
     OPEN, CLOSE = "<tool>", "</tool>"
 
     def __init__(self):
@@ -887,36 +872,36 @@ def sse(obj: dict) -> str:
 
 @api_router.get("/agent/messages")
 async def agent_messages(device: str = Depends(get_device)):
-    docs = await db.messages.find({"device_id": device}).sort("created_at", 1).to_list(500)
-    return [ChatMessage.from_mongo(d).out() for d in docs]
+    docs = await store.find("messages", device, limit=500, order_by="created_at", desc=False)
+    return [ChatMessage.from_doc(d).out() for d in docs]
 
 
 @api_router.delete("/agent/messages")
 async def clear_messages(device: str = Depends(get_device)):
-    await db.messages.delete_many({"device_id": device})
+    await store.delete_many("messages", device)
     return {"ok": True}
 
 
 @api_router.post("/agent/chat")
 async def agent_chat(body: ChatIn, device: str = Depends(get_device)):
-    settings = await get_settings(device)
+    settings_obj = await get_settings(device)
     pro = await billing.is_pro(device)
-    billing.check_local_llm(settings.provider, pro)  # 402 before streaming starts
-    await billing.consume_agent_message(db, device, pro)  # Free: FREE_AGENT_DAILY messages/day
-    prior = await db.messages.find({"device_id": device}).sort("created_at", -1).to_list(20)
+    billing.check_local_llm(settings_obj.provider, pro)  # 402 before streaming starts
+    await billing.consume_agent_message(store, device, pro)  # Free: FREE_AGENT_DAILY messages/day
+    prior = await store.find("messages", device, limit=20, order_by="created_at")
     history = [{"role": d["role"], "content": d["content"]} for d in reversed(prior) if d.get("content")]
-    await db.messages.insert_one(ChatMessage(device_id=device, role="user", content=body.message).to_mongo())
+    await store.insert("messages", ChatMessage(device_id=device, role="user", content=body.message).to_doc())
 
     async def gen():
         visible = ""
         calls: List[ToolCall] = []
         try:
-            session = LLMSession(settings, AGENT_SYSTEM, history)
+            session = LLMSession(settings_obj, AGENT_SYSTEM, history)
             prompt = body.message
             for _ in range(6):
                 raw = ""
                 flt = ToolFilter()
-                await guard_llm(settings, device, pro)  # each agent round is one LLM call
+                await guard_llm(settings_obj, device, pro)  # each agent round is one LLM call
                 async for d in session.stream(prompt):
                     raw += d
                     shown = flt.feed(d)
@@ -963,10 +948,10 @@ async def agent_chat(body: ChatIn, device: str = Depends(get_device)):
             logger.exception("agent error")
             visible += f"\n[Agent error] {str(e)[:300]}"
             yield sse({"type": "error", "text": str(e)[:300]})
-        saved = ChatMessage(device_id=device, role="assistant", content=visible.strip(), tool_calls=calls)
-        res = await db.messages.insert_one(saved.to_mongo())
-        saved.id = str(res.inserted_id)
-        yield sse({"type": "done", "message": saved.out()})
+        saved_msg = ChatMessage(device_id=device, role="assistant", content=visible.strip(), tool_calls=calls)
+        saved = await store.insert("messages", saved_msg.to_doc())
+        saved_msg.id = saved["id"]
+        yield sse({"type": "done", "message": saved_msg.out()})
 
     return StreamingResponse(gen(), media_type="text/event-stream",
                              headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
@@ -974,10 +959,10 @@ async def agent_chat(body: ChatIn, device: str = Depends(get_device)):
 
 @api_router.post("/llm/test")
 async def llm_test(device: str = Depends(get_device)):
-    settings = await get_settings(device)
-    await guard_llm(settings, device, await billing.is_pro(device))
+    settings_obj = await get_settings(device)
+    await guard_llm(settings_obj, device, await billing.is_pro(device))
     try:
-        out = await LLMSession(settings, "Reply with exactly: OK").complete("ping")
+        out = await LLMSession(settings_obj, "Reply with exactly: OK").complete("ping")
         return {"ok": True, "reply": out.strip()[:200]}
     except Exception as e:
         return {"ok": False, "error": str(e)[:300]}
@@ -987,9 +972,10 @@ async def llm_test(device: str = Depends(get_device)):
 async def plan(device: str = Depends(get_device)):
     """The device's plan as the server sees it, with today's usage and limits."""
     pro = await billing.is_pro(device)
-    usage = await billing.get_usage(db, device)
+    usage = await billing.get_usage(store, device)
     return {"pro": pro,
-            "workflows": await db.workflows.count_documents({"device_id": device}),
+            "billing_mode": billing.mode(),
+            "workflows": await store.count("workflows", device),
             "usage_today": {k: usage[k] for k in ("agent", "llm", "code")},
             "limits": {"workflows": None if pro else billing.free_workflow_limit(),
                        "agent_daily": None if pro else billing.free_agent_daily(),
@@ -1002,7 +988,7 @@ async def scheduled_run(wf: Workflow):
         await run_workflow(wf, "schedule")
     except ProRequired as e:
         logger.info("skipped scheduled workflow %s: %s", wf.id, e.detail)
-        await db.workflows.update_one({"_id": ObjectId(wf.id)}, {"$set": {"last_status": "needs_pro", "last_run_at": now_iso()}})
+        await store.update("workflows", wf.id, {"last_status": "needs_pro", "last_run_at": now_iso()})
     except Exception:
         logger.exception("scheduled run failed")
 
@@ -1010,35 +996,19 @@ async def scheduled_run(wf: Workflow):
 async def scheduler_loop():
     while True:
         try:
-            now = now_iso()
-            docs = await db.workflows.find({"active": True, "trigger.type": "schedule",
-                                            "next_run_at": {"$ne": None, "$lte": now}}).to_list(50)
+            docs = await store.due_scheduled(now_iso())
             for d in docs:
-                wf = Workflow.from_mongo(d)
+                wf = Workflow.from_doc(d)
                 # bump next_run first to avoid double execution
                 nxt = (datetime.now(timezone.utc) + timedelta(minutes=max(1, wf.trigger.interval_minutes))).isoformat()
-                await db.workflows.update_one({"_id": d["_id"]}, {"$set": {"next_run_at": nxt}})
+                await store.update("workflows", wf.id, {"next_run_at": nxt})
                 asyncio.create_task(scheduled_run(wf))
         except Exception:
             logger.exception("scheduler error")
         await asyncio.sleep(20)
 
 
-@app.on_event("startup")
-async def startup():
-    try:
-        await db.usage.create_index([("device_id", 1), ("day", 1)], unique=True)
-    except Exception:
-        logger.exception("could not create usage index")
-    if not os.environ.get("REVENUECAT_SECRET_KEY"):
-        await billing.is_pro("startup-check")  # logs the 'everyone is Free' warning once
-    asyncio.create_task(scheduler_loop())
-
-
 app.include_router(api_router)
-app.add_middleware(CORSMiddleware, allow_credentials=True, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
-
-
-@app.on_event("shutdown")
-async def shutdown_db_client():
-    client.close()
+CORS_ORIGINS = [o.strip() for o in os.environ.get("CORS_ORIGINS", "*").split(",") if o.strip()] or ["*"]
+app.add_middleware(CORSMiddleware, allow_credentials=CORS_ORIGINS != ["*"], allow_origins=CORS_ORIGINS,
+                   allow_methods=["*"], allow_headers=["*"])

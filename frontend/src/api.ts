@@ -73,6 +73,13 @@ export type ChatMessage = {
   created_at: string;
 };
 export type N8nWorkflow = { id: string; name: string; active: boolean; updated_at?: string; nodes: number };
+export type Plan = {
+  pro: boolean;
+  billing_mode: "open" | "revenuecat" | string;
+  workflows: number;
+  usage_today: { agent: number; llm: number; code: number };
+  limits: { workflows: number | null; agent_daily: number | null; llm_daily: number; code_daily: number };
+};
 
 // Per-install identity: every device keeps its own workflows, credentials and settings.
 const DEVICE_KEY = "automata_device_id";

@@ -1,7 +1,7 @@
 """Server-side Pro gating, free limits and daily cost caps.
 
-Runs in-process: FastAPI TestClient + mongomock-motor (no real MongoDB needed) and a mocked
-RevenueCat API (httpx.MockTransport). Nothing leaves the machine.
+Runs in-process: FastAPI TestClient over a throwaway SQLite file and a mocked RevenueCat
+API (httpx.MockTransport). Nothing leaves the machine and no service is needed.
 """
 import asyncio
 import json
@@ -14,13 +14,11 @@ import httpx
 import pytest
 from cryptography.fernet import Fernet
 
-os.environ.setdefault("MONGO_URL", "mongodb://localhost:27017")
-os.environ.setdefault("DB_NAME", "automata_test")
 os.environ.setdefault("CREDS_SECRET", Fernet.generate_key().decode())
+os.environ.setdefault("BILLING_MODE", "revenuecat")
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from fastapi.testclient import TestClient  # noqa: E402
-from mongomock_motor import AsyncMongoMockClient  # noqa: E402
 
 import billing  # noqa: E402
 import server  # noqa: E402
@@ -53,15 +51,17 @@ def rc_calls(monkeypatch):
 
     monkeypatch.setattr(billing.httpx, "AsyncClient", fake_client)
     monkeypatch.setenv("REVENUECAT_SECRET_KEY", "sk_test_mock")
+    monkeypatch.setenv("BILLING_MODE", "revenuecat")
     billing.clear_cache()
     yield calls
     billing.clear_cache()
 
 
 @pytest.fixture
-def client(monkeypatch, rc_calls):
-    db = AsyncMongoMockClient()["automata_test_" + uuid.uuid4().hex[:6]]
-    monkeypatch.setattr(server, "db", db)
+def client(tmp_path, monkeypatch, rc_calls):
+    store = server.Store(str(tmp_path / "test.db"))
+    asyncio.run(store.connect())
+    monkeypatch.setattr(server, "store", store)
     # Never call a real LLM or run real code from these tests.
     async def fake_complete(self, text):
         return "fake reply"
@@ -75,8 +75,8 @@ def client(monkeypatch, rc_calls):
     monkeypatch.setattr(server.LLMSession, "complete", fake_complete)
     monkeypatch.setattr(server.LLMSession, "stream", fake_stream)
     monkeypatch.setattr(server.connectors, "run_code", fake_run_code)
-    monkeypatch.setattr(server, "LlmChat", lambda **kw: type("C", (), {"with_model": lambda self, *a: self})())
-    return TestClient(server.app)
+    yield TestClient(server.app)
+    asyncio.run(store.close())
 
 
 def H(device):
@@ -252,7 +252,7 @@ class TestAgentGating:
 
     def test_agent_rejects_local_llm_for_free(self, client):
         d = free_dev()
-        asyncio.run(server.db.settings.update_one({"key": d}, {"$set": {"provider": "local"}}, upsert=True))
+        asyncio.run(server.store.insert("settings", {"id": d, "device_id": d, "provider": "local"}))
         assert _chat(client, d).status_code == 402
 
     def test_agent_run_code_tool_blocked_for_free(self, client):

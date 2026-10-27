@@ -87,3 +87,9 @@ memory/test_credentials.md
 
 # Mobile development
 android-sdk/
+# Automata backend data (SQLite database + generated vault key)
+backend/data/
+*.db
+*.db-wal
+*.db-shm
+.creds_secret

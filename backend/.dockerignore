@@ -1,0 +1,11 @@
+# Keep the image small and free of local state.
+__pycache__/
+*.pyc
+.pytest_cache/
+tests/
+data/
+.env
+*.db
+*.db-wal
+*.db-shm
+.creds_secret

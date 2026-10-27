@@ -1,0 +1,23 @@
+# Run the whole backend with one command:
+#   docker compose up -d --build
+# Then point the app at http://<host>:8001.
+services:
+  api:
+    build:
+      context: ./backend
+    image: automata-api
+    restart: unless-stopped
+    ports:
+      - "8001:8001"
+    env_file:
+      - path: ./backend/.env
+        required: false
+    environment:
+      # Self-hosted default: every feature unlocked. Set to "revenuecat" to sell Pro.
+      BILLING_MODE: ${BILLING_MODE:-open}
+      DATA_DIR: /data
+    volumes:
+      - automata-data:/data
+
+volumes:
+  automata-data:
